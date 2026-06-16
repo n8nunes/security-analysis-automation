@@ -1,19 +1,39 @@
 #!/usr/bin/env python3
 """
 GRC Assessment Agent — Phase 2
-Multi-source passive reconnaissance + Gemini AI analysis
+Multi-source passive reconnaissance + local AI analysis via Ollama
+
+Completely free. No API keys required for core functionality.
+Runs entirely on your machine using open-source LLMs.
+
+Maps findings to: Essential Eight, ISO 27001:2022, NIST CSF 2.0, Privacy Act AU
+
+Setup:
+    1. Install Ollama:  https://ollama.com
+    2. Pull a model:    ollama pull llama3.1
+    3. Install deps:    pip install requests python-dotenv rich
+    4. Copy .env.example → .env and fill in optional keys
+    5. Run it:          python grc_agent_phase2.py "Company" --domain domain.com.au
 
 Usage:
     python grc_agent_phase2.py "Latitude Financial" --domain latitudefinancial.com.au
     python grc_agent_phase2.py "CBA" --domain commbank.com.au --doc policy.txt
-    
-Requirements:
-    pip install requests python-dotenv rich google-generativeai
-    
-Environment variables (.env):
-    GEMINI_API_KEY=AIzaSy...
-    TAVILY_API_KEY=tvly-...          # optional, for news search
-    HIBP_API_KEY=...                  # optional, for breach check
+    python grc_agent_phase2.py "ANZ" --domain anz.com.au --model mistral --no-ssl
+    python grc_agent_phase2.py "Medibank" --domain medibank.com.au --output json
+
+Data sources (all free):
+    - Qualys SSL Labs       (free, no key needed)
+    - SecurityHeaders.com   (free, no key needed)
+    - Tavily news search    (optional — TAVILY_API_KEY in .env, free tier available)
+    - Have I Been Pwned     (optional — HIBP_API_KEY in .env, ~$4 AUD/month)
+    - Document analysis     (--doc flag, any .txt file)
+
+Recommended Ollama models (in order of preference for this task):
+    llama3.1        ollama pull llama3.1          (best quality, ~4.7GB)
+    llama3.2        ollama pull llama3.2          (faster, ~2GB)
+    mistral         ollama pull mistral            (great at JSON, ~4.1GB)
+    gemma2          ollama pull gemma2             (good alternative, ~5.4GB)
+    qwen2.5         ollama pull qwen2.5            (excellent instruction following)
 """
 
 import os
@@ -22,38 +42,38 @@ import time
 import json
 import argparse
 from datetime import datetime
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import ThreadPoolExecutor
 
 import requests
-from google import generativeai as genai
 from dotenv import load_dotenv
 from rich.console import Console
 from rich.panel import Panel
 from rich.table import Table
 from rich.text import Text
-from rich.columns import Columns
 from rich import box
 
 load_dotenv()
 
-# ── CONFIG ────────────────────────────────────────────────────
-GEMINI_API_KEY    = os.getenv("GEMINI_API_KEY", "")
-TAVILY_API_KEY    = os.getenv("TAVILY_API_KEY", "")
-HIBP_API_KEY      = os.getenv("HIBP_API_KEY", "")
-SSL_POLL_INTERVAL = 10  # seconds
-SSL_MAX_WAIT      = 180  # seconds
-USER_AGENT        = "GRC-Assessment-Agent/0.2 (portfolio; passive-recon-only)"
+# ── CONFIG ────────────────────────────────────────────────────────────────────
+
+OLLAMA_HOST   = os.getenv("OLLAMA_HOST",  "http://localhost:11434")
+OLLAMA_MODEL  = os.getenv("OLLAMA_MODEL", "llama3.1")
+TAVILY_API_KEY = os.getenv("TAVILY_API_KEY", "")
+HIBP_API_KEY   = os.getenv("HIBP_API_KEY",   "")
+
+SSL_POLL_INTERVAL = 10   # seconds between SSL Labs polls
+SSL_MAX_WAIT      = 180  # seconds before giving up
+USER_AGENT        = "GRC-Assessment-Agent/0.2 (passive-recon-only; portfolio)"
 
 console = Console()
 
 
-# ── UTILITIES ─────────────────────────────────────────────────
+# ── UTILITIES ─────────────────────────────────────────────────────────────────
 
 def clean_domain(domain: str) -> str:
-    """Strip protocol and path from domain."""
     return domain.replace("https://", "").replace("http://", "").split("/")[0].strip()
 
-def status(icon: str, msg: str, style: str = ""):
+def log(icon: str, msg: str, style: str = "white"):
     console.print(f"  {icon}  {msg}", style=style)
 
 def section(title: str):
@@ -61,124 +81,168 @@ def section(title: str):
     console.print("─" * 60, style="dim")
 
 
-# ── DATA SOURCES ──────────────────────────────────────────────
+# ── OLLAMA HEALTH CHECK ───────────────────────────────────────────────────────
+
+def check_ollama(model: str) -> dict:
+    """
+    Verify Ollama is running and the requested model is available.
+    Returns {"ok": True/False, "models": [...], "error": "..."}
+    """
+    try:
+        r = requests.get(f"{OLLAMA_HOST}/api/tags", timeout=5)
+        r.raise_for_status()
+        available = [m["name"].split(":")[0] for m in r.json().get("models", [])]
+        model_base = model.split(":")[0]
+        return {
+            "ok":        model_base in available,
+            "models":    available,
+            "has_model": model_base in available,
+        }
+    except requests.exceptions.ConnectionError:
+        return {"ok": False, "models": [], "error": "Ollama not running"}
+    except Exception as e:
+        return {"ok": False, "models": [], "error": str(e)}
+
+
+# ── DATA SOURCE 1: SSL LABS ───────────────────────────────────────────────────
 
 def check_ssl(domain: str) -> dict:
-    """Qualys SSL Labs passive TLS/SSL assessment."""
+    """
+    Qualys SSL Labs — passive TLS/SSL assessment. Free, no key required.
+    Docs: https://api.ssllabs.com/api/v3/
+    Takes 60-90s on first scan; uses cached results if available.
+    """
     host = clean_domain(domain)
     base = "https://api.ssllabs.com/api/v3"
-    
+
     try:
-        # Trigger analysis (don't force new if cached)
-        r = requests.get(f"{base}/analyze", params={"host": host, "startNew": "on", "all": "on"},
-                         headers={"User-Agent": USER_AGENT}, timeout=15)
-        r.raise_for_status()
-        
-        # Poll until ready
+        requests.get(
+            f"{base}/analyze",
+            params={"host": host, "startNew": "on", "all": "on"},
+            headers={"User-Agent": USER_AGENT},
+            timeout=15,
+        )
+
         elapsed = 0
         while elapsed < SSL_MAX_WAIT:
             time.sleep(SSL_POLL_INTERVAL)
             elapsed += SSL_POLL_INTERVAL
-            
-            r = requests.get(f"{base}/analyze", params={"host": host, "all": "on"},
-                             headers={"User-Agent": USER_AGENT}, timeout=15)
+
+            r    = requests.get(f"{base}/analyze",
+                                params={"host": host, "all": "on"},
+                                headers={"User-Agent": USER_AGENT}, timeout=15)
             data = r.json()
-            
+
             if data.get("status") == "READY":
                 ep = data.get("endpoints", [{}])[0]
                 d  = ep.get("details", {})
+
+                cert_expiry = None
+                raw_ts = d.get("cert", {}).get("notAfter")
+                if raw_ts:
+                    try:
+                        cert_expiry = datetime.fromtimestamp(raw_ts / 1000).strftime("%d %b %Y")
+                    except Exception:
+                        cert_expiry = str(raw_ts)
+
                 return {
-                    "grade":          ep.get("grade", "Unknown"),
-                    "has_warnings":   ep.get("hasWarnings", False),
-                    "ip":             ep.get("ipAddress"),
-                    "protocols":      [f"{p['name']} {p['version']}" for p in d.get("protocols", [])],
+                    "grade":           ep.get("grade", "Unknown"),
+                    "has_warnings":    ep.get("hasWarnings", False),
+                    "ip":              ep.get("ipAddress"),
+                    "protocols":       [f"{p['name']} {p['version']}" for p in d.get("protocols", [])],
                     "forward_secrecy": d.get("forwardSecrecy", 0) > 0,
-                    "hsts":           d.get("hstsPolicy", {}).get("status", "absent"),
-                    "heartbleed":     d.get("heartbleed", False),
-                    "poodle_tls":     d.get("poodleTls", -3) > 0,
-                    "beast":          d.get("vulnBeast", False),
-                    "robot":          d.get("robotVulnerable", False) if "robotVulnerable" in d else None,
-                    "cert_expiry":    d.get("cert", {}).get("notAfter"),
-                    "cert_subject":   d.get("cert", {}).get("subject"),
-                    "cert_issuer":    d.get("cert", {}).get("issuerSubject"),
+                    "hsts_status":     d.get("hstsPolicy", {}).get("status", "absent"),
+                    "heartbleed":      d.get("heartbleed", False),
+                    "poodle_tls":      d.get("poodleTls", -3) > 0,
+                    "beast":           d.get("vulnBeast", False),
+                    "cert_expiry":     cert_expiry,
+                    "cert_subject":    d.get("cert", {}).get("subject"),
                 }
-            
+
             if data.get("status") == "ERROR":
                 return {"error": data.get("statusMessage", "SSL Labs error")}
-        
-        return {"error": "Timed out"}
-    
+
+            log("  ", f"SSL Labs: still analysing... ({elapsed}s)", "dim")
+
+        return {"error": f"Timed out after {SSL_MAX_WAIT}s"}
+
     except requests.exceptions.RequestException as e:
         return {"error": str(e)}
 
+
+# ── DATA SOURCE 2: SECURITY HEADERS ──────────────────────────────────────────
 
 def check_security_headers(domain: str) -> dict:
-    """SecurityHeaders.com — parse response headers for grade."""
+    """
+    SecurityHeaders.com — HTTP security header grade + direct header check.
+    Free, no key required.
+    """
     host = clean_domain(domain)
+    grade = score = "Unknown"
+
     try:
         r = requests.get(
-            f"https://securityheaders.com/",
+            "https://securityheaders.com/",
             params={"q": host, "followRedirects": "on", "hide": "on"},
             headers={"User-Agent": USER_AGENT},
-            timeout=15
+            timeout=15,
+            allow_redirects=True,
         )
-        grade = r.headers.get("X-Grade", "Unknown")
-        score = r.headers.get("X-Score", "Unknown")
-        
-        # Parse which headers are present/missing from the response
-        present = []
-        missing = []
-        security_headers = [
-            "Content-Security-Policy",
-            "Strict-Transport-Security",
-            "X-Frame-Options",
-            "X-Content-Type-Options",
-            "Referrer-Policy",
-            "Permissions-Policy",
-        ]
-        
-        # Check the actual site for these headers
-        try:
-            site_r = requests.get(
-                f"https://{host}",
-                headers={"User-Agent": USER_AGENT},
-                timeout=10,
-                allow_redirects=True
-            )
-            for h in security_headers:
-                if h.lower() in {k.lower() for k in site_r.headers}:
-                    present.append(h)
-                else:
-                    missing.append(h)
-        except Exception:
-            pass  # If we can't reach the site, we just use the grade
-        
-        return {
-            "grade": grade,
-            "score": score,
-            "present": present,
-            "missing": missing,
-        }
+        raw_grade = r.headers.get("X-Grade", "Unknown")
+        score     = r.headers.get("X-Score", "Unknown")
+        # SecurityHeaders.com returns an error message in X-Grade if no API key
+        # is provided via their new paid tier. Validate it's an actual grade.
+        valid_grades = {"A+", "A", "B", "C", "D", "E", "F"}
+        grade = raw_grade if raw_grade in valid_grades else "Unknown"
+        if raw_grade not in valid_grades and raw_grade != "Unknown":
+            log("⚠", "Security headers grade unavailable (API key required for grade — direct header check still ran)", "yellow")
     except requests.exceptions.RequestException as e:
         return {"error": str(e)}
 
+    # Direct header check on the live site
+    wanted = [
+        "Content-Security-Policy",
+        "Strict-Transport-Security",
+        "X-Frame-Options",
+        "X-Content-Type-Options",
+        "Referrer-Policy",
+        "Permissions-Policy",
+        "Cross-Origin-Opener-Policy",
+        "Cross-Origin-Resource-Policy",
+    ]
+    present, missing = [], []
+    try:
+        site = requests.get(f"https://{host}", headers={"User-Agent": USER_AGENT},
+                            timeout=10, allow_redirects=True)
+        lowered = {k.lower() for k in site.headers}
+        for h in wanted:
+            (present if h.lower() in lowered else missing).append(h)
+    except Exception:
+        pass
+
+    return {"grade": grade, "score": score, "present": present, "missing": missing}
+
+
+# ── DATA SOURCE 3: TAVILY NEWS ────────────────────────────────────────────────
 
 def search_news(company: str) -> dict:
-    """Tavily AI search for recent security incidents."""
+    """
+    Tavily AI-optimised search — recent security incidents.
+    Free tier: https://tavily.com  |  Set TAVILY_API_KEY in .env
+    """
     if not TAVILY_API_KEY:
-        return {"skipped": True, "reason": "TAVILY_API_KEY not set"}
-    
+        return {"skipped": True, "reason": "TAVILY_API_KEY not set in .env"}
     try:
         r = requests.post(
             "https://api.tavily.com/search",
             json={
-                "api_key": TAVILY_API_KEY,
-                "query": f'"{company}" cybersecurity data breach hack incident security Australia',
-                "search_depth": "basic",
-                "max_results": 6,
+                "api_key":        TAVILY_API_KEY,
+                "query":          f'"{company}" cybersecurity breach hack incident security Australia',
+                "search_depth":   "basic",
+                "max_results":    6,
                 "include_answer": True,
             },
-            timeout=30
+            timeout=30,
         )
         r.raise_for_status()
         return r.json()
@@ -186,21 +250,22 @@ def search_news(company: str) -> dict:
         return {"error": str(e)}
 
 
+# ── DATA SOURCE 4: HAVE I BEEN PWNED ─────────────────────────────────────────
+
 def check_hibp(domain: str) -> dict:
-    """Have I Been Pwned — check domain breach history."""
+    """
+    HIBP — known breach history for a domain.
+    ~$4 AUD/month: https://haveibeenpwned.com/API/Key  |  Set HIBP_API_KEY in .env
+    """
     if not HIBP_API_KEY:
-        return {"skipped": True, "reason": "HIBP_API_KEY not set"}
-    
+        return {"skipped": True, "reason": "HIBP_API_KEY not set in .env"}
     host = clean_domain(domain)
     try:
         r = requests.get(
-            f"https://haveibeenpwned.com/api/v3/breaches",
+            "https://haveibeenpwned.com/api/v3/breaches",
             params={"domain": host},
-            headers={
-                "hibp-api-key": HIBP_API_KEY,
-                "User-Agent": USER_AGENT,
-            },
-            timeout=15
+            headers={"hibp-api-key": HIBP_API_KEY, "User-Agent": USER_AGENT},
+            timeout=15,
         )
         if r.status_code == 200:
             breaches = r.json()
@@ -208,552 +273,720 @@ def check_hibp(domain: str) -> dict:
                 "count": len(breaches),
                 "breaches": [
                     {
-                        "name": b["Name"],
-                        "date": b["BreachDate"],
-                        "records": b["PwnCount"],
-                        "data_classes": b["DataClasses"][:5],
-                        "description": b.get("Description", "")[:200]
+                        "name":         b["Name"],
+                        "date":         b["BreachDate"],
+                        "records":      b["PwnCount"],
+                        "data_classes": b["DataClasses"][:6],
                     }
                     for b in breaches
-                ]
+                ],
             }
-        elif r.status_code == 404:
+        if r.status_code == 404:
             return {"count": 0, "breaches": []}
-        else:
-            return {"error": f"HTTP {r.status_code}"}
+        return {"error": f"HTTP {r.status_code}"}
     except requests.exceptions.RequestException as e:
         return {"error": str(e)}
 
 
-# ── GEMINI ANALYSIS ───────────────────────────────────────────
+# ── OLLAMA ANALYSIS ───────────────────────────────────────────────────────────
 
-SYSTEM_PROMPT = """You are a senior GRC analyst specialising in Australian cybersecurity frameworks. 
+SYSTEM_PROMPT = """You are a senior GRC analyst specialising in Australian cybersecurity frameworks.
 
-You receive passive reconnaissance data gathered from public sources and optionally a company document. Synthesise all available intelligence into a comprehensive, accurate GRC assessment.
+You receive passive reconnaissance data from public sources: SSL/TLS results, security headers, news intelligence, breach history, and optionally a company document.
 
-Rules:
-- Only assert what the evidence supports
-- Where technical data contradicts document claims, flag it as a finding  
-- Use maturity 0 for Essential Eight controls with no evidence
-- Be direct about gaps — this is a professional assessment, not marketing
-- Mark confidence LOW if limited data was available
+Your job: synthesise all available data into a structured GRC assessment mapped to Essential Eight, ISO 27001:2022, NIST CSF 2.0, and the Australian Privacy Act.
 
-Respond ONLY with raw JSON matching this schema exactly (no markdown fences, no preamble):
+CRITICAL RULES:
+- Respond with ONLY valid JSON. No explanation, no markdown, no preamble.
+- Only assert what the evidence supports. Mark unobservable controls as Unknown.
+- Where technical evidence contradicts document claims, flag it as a "Contradiction" finding.
+- Be conservative with maturity ratings — only assert what is evidenced.
+- Use maturity 0 when there is no evidence for an Essential Eight control.
 
+Required JSON structure (respond with this exact schema, filled in):
 {
   "executive_summary": "2-3 sentence synthesis of all data sources",
-  "overall_risk_rating": "HIGH|MEDIUM|LOW",
+  "overall_risk_rating": "HIGH",
   "risk_score": 7.5,
-  "confidence": "HIGH|MEDIUM|LOW",
+  "confidence": "MEDIUM",
   "data_sensitivity": "what sensitive data this organisation handles",
-  "data_sources_used": ["SSL Labs", "Security Headers", "News Intelligence", "HIBP", "Document"],
+  "data_sources_used": ["SSL Labs", "Security Headers", "News Intelligence", "HIBP", "Document Analysis"],
   "technical_summary": {
-    "ssl_grade": "A|B|C|D|F|T|Unknown",
-    "headers_grade": "A+|A|B|C|D|E|F|Unknown",
+    "ssl_grade": "Unknown",
+    "headers_grade": "Unknown",
     "known_breaches": 0,
-    "key_vulnerabilities": ["list of specific technical issues found"]
+    "key_vulnerabilities": []
   },
   "findings": [
     {
       "id": "F001",
-      "source": "SSL|Headers|News|HIBP|Document|Inferred",
-      "category": "Privacy|Access Control|Incident Response|Data Security|Third Party Risk|Governance|Transport Security",
-      "severity": "HIGH|MEDIUM|LOW",
-      "title": "concise finding title",
+      "source": "SSL",
+      "category": "Transport Security",
+      "severity": "HIGH",
+      "title": "finding title",
       "observation": "what was found",
       "risk": "what risk this creates"
     }
   ],
   "essential_eight": {
-    "patch_applications":        { "maturity": 0, "notes": "...", "source": "SSL|Headers|News|Document|None" },
-    "patch_os":                  { "maturity": 0, "notes": "...", "source": "..." },
-    "multi_factor_auth":         { "maturity": 0, "notes": "...", "source": "..." },
-    "restrict_admin_privileges": { "maturity": 0, "notes": "...", "source": "..." },
-    "application_control":       { "maturity": 0, "notes": "...", "source": "..." },
-    "restrict_macros":           { "maturity": 0, "notes": "...", "source": "..." },
-    "user_application_hardening":{ "maturity": 0, "notes": "...", "source": "..." },
-    "regular_backups":           { "maturity": 0, "notes": "...", "source": "..." }
+    "patch_applications":         {"maturity": 0, "notes": "...", "source": "None"},
+    "patch_os":                   {"maturity": 0, "notes": "...", "source": "None"},
+    "multi_factor_auth":          {"maturity": 0, "notes": "...", "source": "None"},
+    "restrict_admin_privileges":  {"maturity": 0, "notes": "...", "source": "None"},
+    "application_control":        {"maturity": 0, "notes": "...", "source": "None"},
+    "restrict_macros":            {"maturity": 0, "notes": "...", "source": "None"},
+    "user_application_hardening": {"maturity": 0, "notes": "...", "source": "None"},
+    "regular_backups":            {"maturity": 0, "notes": "...", "source": "None"}
   },
   "iso_27001": [
-    { "domain": "Information Security Policies",    "clause": "A.5",  "status": "Evident|Partial|Gap|Unknown", "notes": "..." },
-    { "domain": "Organisation of Information Security", "clause": "A.6", "status": "...", "notes": "..." },
-    { "domain": "Human Resource Security",          "clause": "A.7",  "status": "...", "notes": "..." },
-    { "domain": "Asset Management",                 "clause": "A.8",  "status": "...", "notes": "..." },
-    { "domain": "Access Control",                   "clause": "A.9",  "status": "...", "notes": "..." },
-    { "domain": "Cryptography",                     "clause": "A.10", "status": "...", "notes": "..." },
-    { "domain": "Physical Security",                "clause": "A.11", "status": "...", "notes": "..." },
-    { "domain": "Operations Security",              "clause": "A.12", "status": "...", "notes": "..." },
-    { "domain": "Communications Security",          "clause": "A.13", "status": "...", "notes": "..." },
-    { "domain": "Supplier Relationships",           "clause": "A.15", "status": "...", "notes": "..." },
-    { "domain": "Incident Management",              "clause": "A.16", "status": "...", "notes": "..." },
-    { "domain": "Business Continuity",              "clause": "A.17", "status": "...", "notes": "..." },
-    { "domain": "Compliance",                       "clause": "A.18", "status": "...", "notes": "..." }
+    {"domain": "Information Security Policies",        "clause": "A.5",  "status": "Unknown", "notes": "..."},
+    {"domain": "Organisation of Information Security", "clause": "A.6",  "status": "Unknown", "notes": "..."},
+    {"domain": "Human Resource Security",              "clause": "A.7",  "status": "Unknown", "notes": "..."},
+    {"domain": "Asset Management",                     "clause": "A.8",  "status": "Unknown", "notes": "..."},
+    {"domain": "Access Control",                       "clause": "A.9",  "status": "Unknown", "notes": "..."},
+    {"domain": "Cryptography",                         "clause": "A.10", "status": "Unknown", "notes": "..."},
+    {"domain": "Physical Security",                    "clause": "A.11", "status": "Unknown", "notes": "..."},
+    {"domain": "Operations Security",                  "clause": "A.12", "status": "Unknown", "notes": "..."},
+    {"domain": "Communications Security",              "clause": "A.13", "status": "Unknown", "notes": "..."},
+    {"domain": "Supplier Relationships",               "clause": "A.15", "status": "Unknown", "notes": "..."},
+    {"domain": "Incident Management",                  "clause": "A.16", "status": "Unknown", "notes": "..."},
+    {"domain": "Business Continuity",                  "clause": "A.17", "status": "Unknown", "notes": "..."},
+    {"domain": "Compliance",                           "clause": "A.18", "status": "Unknown", "notes": "..."}
   ],
   "nist_csf": [
-    { "function": "Govern",   "status": "Evident|Partial|Gap|Unknown", "notes": "..." },
-    { "function": "Identify", "status": "...", "notes": "..." },
-    { "function": "Protect",  "status": "...", "notes": "..." },
-    { "function": "Detect",   "status": "...", "notes": "..." },
-    { "function": "Respond",  "status": "...", "notes": "..." },
-    { "function": "Recover",  "status": "...", "notes": "..." }
+    {"function": "Govern",   "status": "Unknown", "notes": "..."},
+    {"function": "Identify", "status": "Unknown", "notes": "..."},
+    {"function": "Protect",  "status": "Unknown", "notes": "..."},
+    {"function": "Detect",   "status": "Unknown", "notes": "..."},
+    {"function": "Respond",  "status": "Unknown", "notes": "..."},
+    {"function": "Recover",  "status": "Unknown", "notes": "..."}
   ],
   "privacy_act": {
-    "overall_status": "Apparent|Partial|Concern|Unknown",
+    "overall_status": "Unknown",
     "apps_assessed": [
-      { "app": "APP 1 - Open and transparent management", "status": "...", "notes": "..." },
-      { "app": "APP 3 - Collection of personal information", "status": "...", "notes": "..." },
-      { "app": "APP 5 - Notification of collection", "status": "...", "notes": "..." },
-      { "app": "APP 6 - Use and disclosure", "status": "...", "notes": "..." },
-      { "app": "APP 11 - Security of personal information", "status": "...", "notes": "..." },
-      { "app": "APP 12 - Access to personal information", "status": "...", "notes": "..." }
+      {"app": "APP 1 - Open and transparent management",   "status": "Unknown", "notes": "..."},
+      {"app": "APP 3 - Collection of personal information","status": "Unknown", "notes": "..."},
+      {"app": "APP 5 - Notification of collection",        "status": "Unknown", "notes": "..."},
+      {"app": "APP 6 - Use and disclosure",                "status": "Unknown", "notes": "..."},
+      {"app": "APP 11 - Security of personal information", "status": "Unknown", "notes": "..."},
+      {"app": "APP 12 - Access to personal information",   "status": "Unknown", "notes": "..."}
     ]
   },
   "recommendations": [
     {
-      "priority": "HIGH|MEDIUM|LOW",
-      "action": "concise action title",
-      "rationale": "why this matters",
-      "framework_ref": "e.g. Essential Eight - MFA, Level 2",
-      "triggered_by": "what data source surfaced this"
+      "priority":      "HIGH",
+      "action":        "action title",
+      "rationale":     "why this matters",
+      "framework_ref": "Essential Eight — MFA Level 2",
+      "triggered_by":  "which data source surfaced this"
     }
   ],
-  "limitations": "honest note on what passive analysis cannot determine",
-  "assessed_by": "GRC Assessment Agent v0.2 (Phase 2 - Multi-Source Intelligence)",
-  "assessment_date": "ISO date string"
+  "limitations": "note on what passive analysis cannot determine",
+  "assessed_by": "GRC Assessment Agent v0.2 (Phase 2 — Ollama / Local AI)"
 }"""
 
 
 def build_user_message(company, domain, ssl_data, headers_data, news_data, hibp_data, doc_text):
-    lines = [f"Company: {company}"]
-    if domain:
-        lines.append(f"Domain: {domain}")
-    lines.append(f"Assessment date: {datetime.now().strftime('%d %B %Y')}")
-    lines.append("")
+    lines = [
+        f"Company: {company}",
+        f"Domain:  {domain or 'not provided'}",
+        f"Date:    {datetime.now().strftime('%d %B %Y')}",
+        "",
+    ]
 
-    # SSL
     if ssl_data and "error" not in ssl_data:
-        lines.append("=== SSL/TLS ASSESSMENT (Qualys SSL Labs) ===")
-        lines.append(f"Grade: {ssl_data.get('grade', 'Unknown')}")
-        lines.append(f"Has warnings: {ssl_data.get('has_warnings', False)}")
-        if ssl_data.get("protocols"):
-            lines.append(f"Protocols: {', '.join(ssl_data['protocols'])}")
-        lines.append(f"Forward secrecy: {ssl_data.get('forward_secrecy', 'Unknown')}")
-        lines.append(f"HSTS: {ssl_data.get('hsts', 'Unknown')}")
-        if ssl_data.get("heartbleed"):
-            lines.append("⚠ VULNERABLE: Heartbleed")
-        if ssl_data.get("poodle_tls"):
-            lines.append("⚠ VULNERABLE: POODLE TLS")
-        if ssl_data.get("beast"):
-            lines.append("⚠ VULNERABLE: BEAST")
-        if ssl_data.get("cert_expiry"):
-            expiry_ms = ssl_data["cert_expiry"]
-            expiry_dt = datetime.fromtimestamp(expiry_ms / 1000)
-            lines.append(f"Cert expiry: {expiry_dt.strftime('%d %b %Y')}")
-        lines.append("")
-    elif ssl_data and "error" in ssl_data:
-        lines.append(f"=== SSL/TLS ASSESSMENT: Failed — {ssl_data['error']} ===\n")
+        lines += [
+            "=== SSL/TLS ASSESSMENT (Qualys SSL Labs) ===",
+            f"Grade:          {ssl_data.get('grade', 'Unknown')}",
+            f"Has warnings:   {ssl_data.get('has_warnings', False)}",
+            f"Protocols:      {', '.join(ssl_data.get('protocols', []))}",
+            f"Forward secrecy:{ssl_data.get('forward_secrecy', 'Unknown')}",
+            f"HSTS status:    {ssl_data.get('hsts_status', 'Unknown')}",
+            f"Heartbleed:     {'VULNERABLE' if ssl_data.get('heartbleed') else 'Not vulnerable'}",
+            f"POODLE TLS:     {'VULNERABLE' if ssl_data.get('poodle_tls') else 'Not vulnerable'}",
+            f"BEAST:          {'VULNERABLE' if ssl_data.get('beast') else 'Not vulnerable'}",
+            f"Cert expiry:    {ssl_data.get('cert_expiry', 'Unknown')}",
+            "",
+        ]
+    elif ssl_data:
+        lines += [f"=== SSL/TLS ASSESSMENT: Failed — {ssl_data.get('error')} ===", ""]
 
-    # Headers
     if headers_data and "error" not in headers_data:
-        lines.append("=== SECURITY HEADERS ===")
-        lines.append(f"Grade: {headers_data.get('grade', 'Unknown')}")
-        lines.append(f"Score: {headers_data.get('score', 'Unknown')}")
-        if headers_data.get("missing"):
-            lines.append(f"Missing headers: {', '.join(headers_data['missing'])}")
-        if headers_data.get("present"):
-            lines.append(f"Present headers: {', '.join(headers_data['present'])}")
-        lines.append("")
-    elif headers_data and "error" in headers_data:
-        lines.append(f"=== SECURITY HEADERS: Failed — {headers_data['error']} ===\n")
+        lines += [
+            "=== SECURITY HEADERS ===",
+            f"Grade:   {headers_data.get('grade', 'Unknown')}",
+            f"Score:   {headers_data.get('score', 'Unknown')}",
+            f"Present: {', '.join(headers_data.get('present', [])) or 'None detected'}",
+            f"Missing: {', '.join(headers_data.get('missing', [])) or 'None detected'}",
+            "",
+        ]
+    elif headers_data:
+        lines += [f"=== SECURITY HEADERS: Failed — {headers_data.get('error')} ===", ""]
 
-    # HIBP
-    if hibp_data and "error" not in hibp_data and "skipped" not in hibp_data:
-        lines.append("=== HAVE I BEEN PWNED — BREACH HISTORY ===")
-        lines.append(f"Known breaches: {hibp_data.get('count', 0)}")
+    if hibp_data and "error" not in hibp_data and not hibp_data.get("skipped"):
+        lines += [
+            "=== HAVE I BEEN PWNED ===",
+            f"Known breaches: {hibp_data.get('count', 0)}",
+        ]
         for b in hibp_data.get("breaches", []):
-            lines.append(f"- {b['name']} ({b['date']}): {b['records']:,} records | Data: {', '.join(b['data_classes'])}")
+            lines.append(
+                f"  - {b['name']} ({b['date']}): "
+                f"{b['records']:,} records | {', '.join(b['data_classes'])}"
+            )
         lines.append("")
     elif hibp_data and hibp_data.get("skipped"):
-        lines.append("=== HIBP: Skipped (no API key) ===\n")
+        lines += ["=== HIBP: Skipped (no HIBP_API_KEY) ===", ""]
 
-    # News
-    if news_data and "error" not in news_data and "skipped" not in news_data:
-        lines.append("=== NEWS INTELLIGENCE (Tavily) ===")
+    if news_data and "error" not in news_data and not news_data.get("skipped"):
+        lines += ["=== NEWS INTELLIGENCE ==="]
         if news_data.get("answer"):
             lines.append(f"Summary: {news_data['answer']}")
         for r in news_data.get("results", [])[:5]:
-            lines.append(f"- {r.get('title', '')}: {r.get('content', '')[:250]}...")
+            snippet = (r.get("content") or "")[:300]
+            lines.append(f"  - {r.get('title', '')}: {snippet}...")
         lines.append("")
     elif news_data and news_data.get("skipped"):
-        lines.append("=== NEWS: Skipped (no API key) ===\n")
+        lines += ["=== NEWS: Skipped (no TAVILY_API_KEY) ===", ""]
 
-    # Document
     if doc_text and doc_text.strip():
-        lines.append("=== COMPANY DOCUMENT ===")
-        lines.append(doc_text[:30000])  # Gemini handles much larger context windows
+        lines += ["=== COMPANY DOCUMENT ===", doc_text[:8000]]
     else:
-        lines.append("=== DOCUMENT: Not provided — base assessment on technical data only ===")
+        lines += ["=== DOCUMENT: Not provided — base assessment on technical data only ==="]
 
     return "\n".join(lines)
 
 
-def analyse_with_gemini(user_message: str) -> dict:
-    """Call Gemini API and parse JSON response."""
-    if not GEMINI_API_KEY:
-        raise ValueError("GEMINI_API_KEY not set in environment")
-        
-    genai.configure(api_key=GEMINI_API_KEY)
-    
-    # Using gemini-1.5-pro for best reasoning capabilities and large document analysis
-    model = genai.GenerativeModel(
-        model_name="gemini-1.5-pro",
-        system_instruction=SYSTEM_PROMPT,
-        generation_config={
-            "response_mime_type": "application/json"
-        }
-    )
-    
+def analyse_with_ollama(user_message: str, model: str) -> dict:
+    """
+    Send gathered intelligence to a local Ollama model for GRC analysis.
+    Uses format='json' to constrain output to valid JSON.
+    """
+    url = f"{OLLAMA_HOST}/api/chat"
+
     try:
-        response = model.generate_content(user_message)
-        # Strip potential markdown codeblocks just in case, though mime_type should handle it
-        text = response.text.strip().lstrip("```json").lstrip("```").rstrip("```").strip()
-        return json.loads(text)
-    except Exception as e:
-        raise RuntimeError(f"Gemini API request failed: {e}")
+        r = requests.post(
+            url,
+            json={
+                "model":  model,
+                "messages": [
+                    {"role": "system", "content": SYSTEM_PROMPT},
+                    {"role": "user",   "content": user_message},
+                ],
+                "stream": False,
+                "format": "json",      # Force valid JSON output
+                "options": {
+                    "temperature": 0.1,  # Low temp = consistent structured output
+                    "num_ctx":     8192, # Context window — increase if model supports it
+                },
+            },
+            timeout=600,  # Local inference can be slow on CPU — 10 min ceiling
+        )
+        r.raise_for_status()
+
+    except requests.exceptions.ConnectionError:
+        raise ConnectionError(
+            f"Cannot connect to Ollama at {OLLAMA_HOST}.\n"
+            "  → Install: https://ollama.com\n"
+            f"  → Pull model: ollama pull {model}\n"
+            "  → Start: ollama serve"
+        )
+
+    content = r.json().get("message", {}).get("content", "").strip()
+
+    # Strip markdown fences if the model added them despite format=json
+    if content.startswith("```"):
+        parts = content.split("```")
+        content = parts[1] if len(parts) > 1 else content
+        if content.startswith("json"):
+            content = content[4:]
+    content = content.strip()
+
+    try:
+        return json.loads(content)
+    except json.JSONDecodeError as e:
+        # Try to extract JSON object if there's surrounding text
+        start = content.find("{")
+        end   = content.rfind("}") + 1
+        if start != -1 and end > start:
+            return json.loads(content[start:end])
+        raise ValueError(f"Model did not return valid JSON: {e}\n\nRaw output:\n{content[:500]}")
 
 
-# ── TERMINAL REPORT ───────────────────────────────────────────
+# ── TERMINAL REPORT ───────────────────────────────────────────────────────────
 
-RISK_COLORS = {"HIGH": "bold red", "MEDIUM": "bold yellow", "LOW": "bold green"}
-STATUS_COLORS = {
+RISK_STYLE   = {"HIGH": "bold red", "MEDIUM": "bold yellow", "LOW": "bold green"}
+STATUS_STYLE = {
     "Evident": "green", "Apparent": "green",
     "Partial": "yellow",
     "Gap": "red", "Concern": "red",
     "Unknown": "dim",
 }
 
-def grade_color(grade: str) -> str:
-    if not grade or grade == "Unknown": return "dim"
-    g = grade.upper()
-    if g.startswith("A"): return "green"
-    if g == "B": return "yellow"
-    if g == "C": return "dark_orange"
+def grade_style(g: str) -> str:
+    if not g or g == "Unknown":  return "dim"
+    if g.upper().startswith("A"): return "green"
+    if g.upper() == "B":          return "yellow"
+    if g.upper() == "C":          return "dark_orange"
     return "red"
 
-def render_report(report: dict, company: str, domain: str = ""):
+def maturity_bar(level) -> str:
+    try:
+        level = int(level)
+    except (TypeError, ValueError):
+        level = 0
+    level = max(0, min(4, level))  # clamp to 0-4
+    if level == 0:
+        return "[dim]·  ·  ·  ·  unknown[/dim]"
+    color = "green" if level >= 3 else "yellow" if level == 2 else "red"
+    return f"[{color}]{'█' * level}{'░' * (4 - level)}  L{level}[/{color}]"
+
+
+def _s(v, fallback="") -> str:
+    """Safely coerce any value to a non-None string."""
+    if v is None:
+        return fallback
+    if isinstance(v, dict):
+        # Model returned an object where a string was expected — grab the most useful field
+        for key in ("name", "type", "title", "description", "value", "text"):
+            if key in v:
+                return str(v[key])
+        return str(v)
+    return str(v)
+
+
+def sanitize_report(report: dict) -> dict:
+    """
+    Normalise model output before rendering.
+    Local models occasionally return wrong types — dicts where strings are
+    expected, strings where ints are expected, None for missing fields, etc.
+    This pass makes the renderer crash-proof regardless of what the model did.
+    """
+    # Top-level strings
+    for key in ("executive_summary", "overall_risk_rating", "confidence",
+                "data_sensitivity", "limitations", "assessed_by", "assessment_date"):
+        report[key] = _s(report.get(key))
+
+    # risk_score → float
+    try:
+        report["risk_score"] = float(report.get("risk_score") or 0)
+    except (TypeError, ValueError):
+        report["risk_score"] = 0.0
+
+    # data_sources_used → list of strings
+    sources = report.get("data_sources_used", [])
+    report["data_sources_used"] = [_s(s) for s in sources] if isinstance(sources, list) else []
+
+    # technical_summary
+    tech = report.get("technical_summary")
+    if not isinstance(tech, dict):
+        report["technical_summary"] = {}
+        tech = report["technical_summary"]
+    tech["ssl_grade"]     = _s(tech.get("ssl_grade"),     "Unknown")
+    tech["headers_grade"] = _s(tech.get("headers_grade"), "Unknown")
+    try:
+        tech["known_breaches"] = int(tech.get("known_breaches") or 0)
+    except (TypeError, ValueError):
+        tech["known_breaches"] = 0
+    vulns = tech.get("key_vulnerabilities", [])
+    tech["key_vulnerabilities"] = (
+        [_s(v) for v in vulns] if isinstance(vulns, list) else []
+    )
+
+    # findings
+    findings = report.get("findings", [])
+    if not isinstance(findings, list):
+        report["findings"] = []
+    else:
+        for f in findings:
+            if isinstance(f, dict):
+                for k in ("id", "source", "category", "severity", "title", "observation", "risk"):
+                    f[k] = _s(f.get(k))
+
+    # essential_eight
+    e8 = report.get("essential_eight", {})
+    if not isinstance(e8, dict):
+        report["essential_eight"] = {}
+        e8 = report["essential_eight"]
+    for ctrl, val in e8.items():
+        if not isinstance(val, dict):
+            e8[ctrl] = {"maturity": 0, "notes": "", "source": ""}
+            val = e8[ctrl]
+        try:
+            val["maturity"] = int(val.get("maturity") or 0)
+        except (TypeError, ValueError):
+            val["maturity"] = 0
+        val["notes"]  = _s(val.get("notes"))
+        val["source"] = _s(val.get("source"))
+
+    # iso_27001
+    iso = report.get("iso_27001", [])
+    if isinstance(iso, list):
+        for d in iso:
+            if isinstance(d, dict):
+                for k in ("domain", "clause", "status", "notes"):
+                    d[k] = _s(d.get(k))
+
+    # nist_csf
+    nist = report.get("nist_csf", [])
+    if isinstance(nist, list):
+        for fn in nist:
+            if isinstance(fn, dict):
+                for k in ("function", "status", "notes"):
+                    fn[k] = _s(fn.get(k))
+
+    # privacy_act
+    pa = report.get("privacy_act", {})
+    if not isinstance(pa, dict):
+        report["privacy_act"] = {"overall_status": "Unknown", "apps_assessed": []}
+        pa = report["privacy_act"]
+    pa["overall_status"] = _s(pa.get("overall_status"), "Unknown")
+    apps = pa.get("apps_assessed", [])
+    if isinstance(apps, list):
+        for app in apps:
+            if isinstance(app, dict):
+                for k in ("app", "status", "notes"):
+                    app[k] = _s(app.get(k))
+
+    # recommendations
+    recs = report.get("recommendations", [])
+    if isinstance(recs, list):
+        for rec in recs:
+            if isinstance(rec, dict):
+                for k in ("priority", "action", "rationale", "framework_ref", "triggered_by"):
+                    rec[k] = _s(rec.get(k))
+
+    return report
+
+
+def render_report(report: dict, company: str, domain: str = "", model: str = ""):
     console.print()
-    
-    # ── Header ──
-    risk = report.get("overall_risk_rating", "UNKNOWN")
+    risk  = report.get("overall_risk_rating", "UNKNOWN")
     score = report.get("risk_score", 0)
-    risk_color = RISK_COLORS.get(risk, "white")
-    
-    header_text = Text()
-    header_text.append(f"  {company.upper()}  ", style="bold white")
-    header_text.append(f"| {risk} RISK  ", style=risk_color)
-    header_text.append(f"| Score: {score}/10  ", style="white")
-    header_text.append(f"| Confidence: {report.get('confidence', '?')}  ", style="dim")
+    rc    = RISK_STYLE.get(risk, "white")
+
+    header = Text()
+    header.append(f"  {company.upper()}  ",         style="bold white")
+    header.append(f"│  {risk} RISK  ",              style=rc)
+    header.append(f"│  Score {score}/10  ",          style="white")
+    header.append(f"│  Confidence: {report.get('confidence', '?')}  ", style="dim")
     if domain:
-        header_text.append(f"| {domain}", style="dim")
-    
+        header.append(f"│  {domain}", style="dim")
     console.print(Panel(
-        header_text,
-        title="[bold]GRC Assessment Agent v0.2[/bold]",
-        subtitle=f"[dim]{report.get('assessment_date', datetime.now().strftime('%d %B %Y'))}[/dim]",
-        border_style=risk_color,
+        header,
+        title=f"[bold]GRC Assessment Agent v0.2[/bold]  [dim]· Ollama · {model}[/dim]",
+        subtitle=f"[dim]{report.get('assessment_date', '')} · Passive reconnaissance only[/dim]",
+        border_style=rc,
     ))
 
-    # ── Executive Summary ──
     section("Executive Summary")
-    console.print(f"  {report.get('executive_summary', '')}\n", style="white")
-    console.print(f"  [dim]Data handled:[/dim] {report.get('data_sensitivity', '')}\n")
-    console.print(f"  [dim]Sources used:[/dim] {', '.join(report.get('data_sources_used', []))}\n")
+    console.print(f"  {report.get('executive_summary', '')}", style="white")
+    console.print(f"\n  [dim]Data handled:[/dim]  {report.get('data_sensitivity', '')}")
+    console.print(f"  [dim]Sources used:[/dim]  {', '.join(_s(x) for x in report.get('data_sources_used', []))}\n")
 
-    # ── Technical Summary ──
     tech = report.get("technical_summary", {})
     if tech:
-        section("Technical Reconnaissance")
-        cols = []
-        ssl_g = tech.get("ssl_grade", "Unknown")
-        hdr_g = tech.get("headers_grade", "Unknown")
-        breaches = tech.get("known_breaches", 0)
+        section("Technical Snapshot")
+        t = Table(box=box.SIMPLE, show_header=False, padding=(0, 2))
+        t.add_column("Key",   style="dim", width=20)
+        t.add_column("Value", min_width=40)
+        sg = tech.get("ssl_grade",     "Unknown")
+        hg = tech.get("headers_grade", "Unknown")
+        bc = int(tech.get("known_breaches") or 0)
+        t.add_row("SSL Grade",     f"[{grade_style(sg)}]{sg}[/{grade_style(sg)}]")
+        t.add_row("Headers Grade", f"[{grade_style(hg)}]{hg}[/{grade_style(hg)}]")
+        t.add_row("Known Breaches",f"[{'red' if bc > 0 else 'green'}]{bc}[/]")
         vulns = tech.get("key_vulnerabilities", [])
-        
-        t = Table(box=box.SIMPLE, show_header=False, padding=(0, 1))
-        t.add_column("Key", style="dim")
-        t.add_column("Value")
-        t.add_row("SSL Grade", f"[{grade_color(ssl_g)}]{ssl_g}[/{grade_color(ssl_g)}]")
-        t.add_row("Headers Grade", f"[{grade_color(hdr_g)}]{hdr_g}[/{grade_color(hdr_g)}]")
-        t.add_row("Known Breaches", f"[{'red' if breaches > 0 else 'green'}]{breaches}[/{'red' if breaches > 0 else 'green'}]")
         if vulns:
-            t.add_row("Vulnerabilities", "[red]" + ", ".join(vulns[:3]) + "[/red]")
+            t.add_row("Vulnerabilities", "[red]" + " · ".join(vulns) + "[/red]")
         console.print(t)
 
-    # ── Findings ──
     findings = report.get("findings", [])
     if findings:
-        section(f"Findings ({len(findings)} total)")
+        section(f"Findings  ({len(findings)})")
         t = Table(box=box.SIMPLE, show_header=True, padding=(0, 1), expand=True)
         t.add_column("ID",       style="dim",  width=5)
-        t.add_column("Sev",                    width=8)
-        t.add_column("Source",   style="dim",  width=10)
-        t.add_column("Category", style="dim",  width=18)
-        t.add_column("Finding",                min_width=30)
-        
+        t.add_column("Severity",               width=10)
+        t.add_column("Source",   style="dim",  width=14)
+        t.add_column("Category", style="dim",  width=20)
+        t.add_column("Finding",                min_width=28)
         for f in findings:
             sev = f.get("severity", "")
             t.add_row(
                 f.get("id", ""),
-                f"[{RISK_COLORS.get(sev, 'white')}]{sev}[/]",
+                f"[{RISK_STYLE.get(sev, 'white')}]{sev}[/]",
                 f.get("source", ""),
                 f.get("category", ""),
                 f.get("title", ""),
             )
         console.print(t)
 
-        # Detail for HIGH findings
-        high = [f for f in findings if f.get("severity") == "HIGH"]
-        if high:
-            console.print("  [bold red]High severity detail:[/bold red]")
-            for f in high:
-                console.print(f"  [{f['id']}] {f['title']}")
-                console.print(f"       Observation: {f.get('observation', '')}", style="dim")
-                console.print(f"       Risk: {f.get('risk', '')}\n", style="dim red")
+        highs = [f for f in findings if f.get("severity") == "HIGH"]
+        if highs:
+            console.print("  [bold red]High severity — detail[/bold red]\n")
+            for f in highs:
+                console.print(f"  [bold]{f['id']}  {f['title']}[/bold]")
+                console.print(f"  Observation: {f.get('observation', '')}", style="dim")
+                console.print(f"  Risk:        {f.get('risk', '')}\n",       style="dim red")
 
-    # ── Essential Eight ──
     section("Essential Eight Maturity")
-    e8 = report.get("essential_eight", {})
     e8_labels = {
-        "patch_applications": "Patch Applications",
-        "patch_os": "Patch OS",
-        "multi_factor_auth": "MFA",
-        "restrict_admin_privileges": "Restrict Admin",
-        "application_control": "App Control",
-        "restrict_macros": "Restrict Macros",
+        "patch_applications":         "Patch Applications",
+        "patch_os":                   "Patch OS",
+        "multi_factor_auth":          "MFA",
+        "restrict_admin_privileges":  "Restrict Admin",
+        "application_control":        "App Control",
+        "restrict_macros":            "Restrict Macros",
         "user_application_hardening": "App Hardening",
-        "regular_backups": "Backups",
+        "regular_backups":            "Backups",
     }
     t = Table(box=box.SIMPLE, show_header=True, padding=(0, 1), expand=True)
-    t.add_column("Control",  width=22)
-    t.add_column("Maturity", width=10)
+    t.add_column("Control",  width=24)
+    t.add_column("Maturity", width=18)
     t.add_column("Source",   style="dim", width=12)
-    t.add_column("Notes",    min_width=30)
-    
+    t.add_column("Notes",    min_width=28)
     for key, label in e8_labels.items():
-        val = e8.get(key, {})
-        m = val.get("maturity", 0)
-        bar = "█" * m + "░" * (4 - m) if m > 0 else "? ? ? ?"
-        bar_color = "green" if m >= 3 else "yellow" if m >= 2 else "red" if m == 1 else "dim"
-        t.add_row(
-            label,
-            f"[{bar_color}]{bar} L{m}[/{bar_color}]" if m > 0 else f"[dim]{bar}[/dim]",
-            val.get("source", ""),
-            val.get("notes", ""),
-        )
+        val = report.get("essential_eight", {}).get(key, {})
+        t.add_row(label, maturity_bar(val.get("maturity", 0)),
+                  val.get("source", ""), val.get("notes", ""))
     console.print(t)
 
-    # ── ISO 27001 ──
-    section("ISO 27001:2022 Domains")
+    section("ISO 27001:2022")
     t = Table(box=box.SIMPLE, show_header=True, padding=(0, 1), expand=True)
-    t.add_column("Clause", style="dim", width=6)
-    t.add_column("Domain",              width=30)
+    t.add_column("Clause", style="dim", width=7)
+    t.add_column("Domain",              width=32)
     t.add_column("Status",              width=10)
     t.add_column("Notes",               min_width=25)
     for d in report.get("iso_27001", []):
         st = d.get("status", "Unknown")
-        t.add_row(
-            d.get("clause", ""),
-            d.get("domain", ""),
-            f"[{STATUS_COLORS.get(st, 'white')}]{st}[/{STATUS_COLORS.get(st, 'white')}]",
-            d.get("notes", ""),
-        )
+        t.add_row(d.get("clause",""), d.get("domain",""),
+                  f"[{STATUS_STYLE.get(st,'white')}]{st}[/]", d.get("notes",""))
     console.print(t)
 
-    # ── NIST CSF ──
     section("NIST CSF 2.0")
     t = Table(box=box.SIMPLE, show_header=True, padding=(0, 1))
-    t.add_column("Function",  width=12)
-    t.add_column("Status",    width=10)
-    t.add_column("Notes",     min_width=40)
+    t.add_column("Function", width=12)
+    t.add_column("Status",   width=10)
+    t.add_column("Notes",    min_width=44)
     for fn in report.get("nist_csf", []):
         st = fn.get("status", "Unknown")
-        t.add_row(
-            fn.get("function", ""),
-            f"[{STATUS_COLORS.get(st, 'white')}]{st}[/{STATUS_COLORS.get(st, 'white')}]",
-            fn.get("notes", ""),
-        )
+        t.add_row(fn.get("function",""),
+                  f"[{STATUS_STYLE.get(st,'white')}]{st}[/]", fn.get("notes",""))
     console.print(t)
 
-    # ── Recommendations ──
+    section("Australian Privacy Act — APPs")
+    pa = report.get("privacy_act", {})
+    overall = pa.get("overall_status", "Unknown")
+    console.print(f"  Overall: [{STATUS_STYLE.get(overall,'white')}]{overall}[/]\n")
+    t = Table(box=box.SIMPLE, show_header=True, padding=(0, 1), expand=True)
+    t.add_column("APP",    width=40)
+    t.add_column("Status", width=10)
+    t.add_column("Notes",  min_width=26)
+    for app in pa.get("apps_assessed", []):
+        st = app.get("status", "Unknown")
+        t.add_row(app.get("app",""),
+                  f"[{STATUS_STYLE.get(st,'white')}]{st}[/]", app.get("notes",""))
+    console.print(t)
+
     recs = report.get("recommendations", [])
     if recs:
-        section(f"Recommendations ({len(recs)})")
+        section(f"Recommendations  ({len(recs)})")
         for i, rec in enumerate(recs, 1):
             p = rec.get("priority", "")
-            console.print(f"  [{i}] [{RISK_COLORS.get(p, 'white')}]{p}[/] — {rec.get('action', '')}")
-            console.print(f"       {rec.get('rationale', '')}", style="dim")
-            console.print(f"       [{rec.get('framework_ref', '')}] · triggered by: {rec.get('triggered_by', '')}\n", style="dim")
+            console.print(f"  [{i}] [{RISK_STYLE.get(p,'white')}]{p}[/]  {rec.get('action','')}")
+            console.print(f"       {rec.get('rationale','')}",   style="dim")
+            console.print(f"       {rec.get('framework_ref','')}  ·  triggered by: {rec.get('triggered_by','')}\n",
+                          style="dim")
 
-    # ── Disclaimer ──
     console.print(Panel(
-        f"[dim]{report.get('limitations', '')}\n\n"
-        "Passive reconnaissance only — no active scanning. Findings are indicative and require "
-        "human review before professional use. Not a substitute for authorised security assessment.[/dim]",
+        f"[dim]{report.get('limitations','')}\n\n"
+        "Passive reconnaissance only — no active scanning. "
+        "Findings are indicative and require human review before professional use. "
+        "Not a substitute for authorised security assessment or legal advice.[/dim]",
         title="[dim]Disclaimer[/dim]",
         border_style="dim",
     ))
 
 
-# ── MAIN ──────────────────────────────────────────────────────
+# ── MAIN ──────────────────────────────────────────────────────────────────────
 
 def main():
     parser = argparse.ArgumentParser(
-        description="GRC Assessment Agent v0.2 — passive multi-source reconnaissance",
-        epilog="Example: python grc_agent_phase2.py 'Latitude Financial' --domain latitudefinancial.com.au"
+        description="GRC Assessment Agent v0.2 — free, local, Ollama-powered",
+        epilog=(
+            "Examples:\n"
+            "  python grc_agent_phase2.py 'Latitude Financial' --domain latitudefinancial.com.au\n"
+            "  python grc_agent_phase2.py 'CBA' --domain commbank.com.au --doc policy.txt\n"
+            "  python grc_agent_phase2.py 'ANZ' --domain anz.com.au --model mistral --no-ssl\n"
+            "  python grc_agent_phase2.py 'Medibank' --output json\n"
+        ),
+        formatter_class=argparse.RawDescriptionHelpFormatter,
     )
-    parser.add_argument("company",         help="Company name")
-    parser.add_argument("--domain", "-d",  help="Domain to scan (e.g. commbank.com.au)")
-    parser.add_argument("--doc",    "-f",  help="Path to document file (.txt, .pdf text)")
-    parser.add_argument("--output", "-o",  default="both", choices=["terminal", "json", "both"],
-                        help="Output format (default: both)")
-    parser.add_argument("--no-ssl",        action="store_true", help="Skip SSL Labs check")
-    parser.add_argument("--no-headers",    action="store_true", help="Skip security headers check")
-    parser.add_argument("--no-news",       action="store_true", help="Skip news search")
-    parser.add_argument("--no-hibp",       action="store_true", help="Skip HIBP breach check")
+    parser.add_argument("company",            help='Company name  e.g. "Latitude Financial"')
+    parser.add_argument("--domain",   "-d",   help="Domain to scan  e.g. latitudefinancial.com.au")
+    parser.add_argument("--doc",      "-f",   help="Path to .txt document for analysis")
+    parser.add_argument("--model",    "-m",   default=OLLAMA_MODEL,
+                        help=f"Ollama model to use (default: {OLLAMA_MODEL})")
+    parser.add_argument("--output",   "-o",   default="both",
+                        choices=["terminal", "json", "both"])
+    parser.add_argument("--no-ssl",           action="store_true")
+    parser.add_argument("--no-headers",       action="store_true")
+    parser.add_argument("--no-news",          action="store_true")
+    parser.add_argument("--no-hibp",          action="store_true")
+    parser.add_argument("--list-models",      action="store_true",
+                        help="List available Ollama models and exit")
     args = parser.parse_args()
 
-    # ── Startup banner ──
     console.print(Panel(
-        "[bold white]GRC Assessment Agent[/bold white] [dim]v0.2 — Phase 2 Multi-Source Intelligence[/dim]\n"
-        "[dim]Passive reconnaissance only · Australian frameworks · AI-powered analysis[/dim]",
+        f"[bold white]GRC Assessment Agent[/bold white]  "
+        f"[dim]v0.2 · Phase 2 · Ollama / {args.model}[/dim]\n"
+        "[dim]Free · Local · Passive recon · Australian frameworks[/dim]",
         border_style="blue",
     ))
 
-    # ── Validate ──
-    if not GEMINI_API_KEY:
-        console.print("[red]✗ GEMINI_API_KEY not set. Add it to your .env file.[/red]")
+    # Check Ollama
+    ollama_status = check_ollama(args.model)
+
+    if args.list_models:
+        if not ollama_status.get("models"):
+            console.print("[red]✗  Ollama not running or no models installed.[/red]")
+            console.print("  Install: https://ollama.com")
+        else:
+            console.print("\n  [bold]Available models:[/bold]")
+            for m in ollama_status["models"]:
+                console.print(f"  → {m}")
+            console.print("\n  Recommended for this task: llama3.1, mistral, gemma2, qwen2.5\n")
+        sys.exit(0)
+
+    if not ollama_status.get("ok"):
+        err = ollama_status.get("error", "unknown error")
+        if "not running" in err:
+            console.print(f"\n[red]✗  Ollama is not running.[/red]")
+            console.print("  → Install:    https://ollama.com")
+            console.print("  → Start:      ollama serve")
+            console.print(f"  → Pull model: ollama pull {args.model}\n")
+        else:
+            console.print(f"\n[red]✗  Model '{args.model}' not found in Ollama.[/red]")
+            console.print(f"  → Run: ollama pull {args.model}")
+            if ollama_status.get("models"):
+                console.print(f"  → Available: {', '.join(ollama_status['models'])}")
         sys.exit(1)
 
+    log("✓", f"Ollama running · model: [bold]{args.model}[/bold]", "green")
+
+    # Load document
     doc_text = ""
     if args.doc:
         try:
-            with open(args.doc, "r", encoding="utf-8", errors="ignore") as f:
-                doc_text = f.read()
-            status("📄", f"Document loaded: {args.doc} ({len(doc_text):,} chars)")
+            with open(args.doc, encoding="utf-8", errors="ignore") as fh:
+                doc_text = fh.read()
+            log("📄", f"Document: {args.doc}  ({len(doc_text):,} chars)")
         except FileNotFoundError:
-            status("⚠", f"Document not found: {args.doc}", "yellow")
+            log("⚠", f"Document not found: {args.doc}", "yellow")
 
-    # ── Data gathering ──
-    console.print()
-    console.print("[bold white]Gathering intelligence...[/bold white]")
-    console.print("─" * 60, style="dim")
-
-    ssl_data     = None
-    headers_data = None
-    news_data    = None
-    hibp_data    = None
+    # ── Intelligence gathering ──────────────────────────────────────────────
+    section("Gathering intelligence")
+    ssl_data = headers_data = news_data = hibp_data = None
 
     if args.domain:
-        # Run non-SSL checks in parallel (they're fast)
         with ThreadPoolExecutor(max_workers=3) as ex:
             futures = {}
-            
-            if not args.no_headers:
-                status("⟳", "Security headers check starting...")
-                futures["headers"] = ex.submit(check_security_headers, args.domain)
-            
-            if not args.no_hibp:
-                if HIBP_API_KEY:
-                    status("⟳", "HIBP breach history check starting...")
-                    futures["hibp"] = ex.submit(check_hibp, args.domain)
-                else:
-                    status("○", "HIBP: skipped (no HIBP_API_KEY)", "dim")
-            
-            if not args.no_news:
-                if TAVILY_API_KEY:
-                    status("⟳", "News intelligence search starting...")
-                    futures["news"] = ex.submit(search_news, args.company)
-                else:
-                    status("○", "News search: skipped (no TAVILY_API_KEY)", "dim")
 
-            # SSL Labs runs separately (it's slow and needs its own status updates)
+            if not args.no_headers:
+                log("⟳", f"Security headers: {args.domain}...")
+                futures["headers"] = ex.submit(check_security_headers, args.domain)
+
+            if not args.no_hibp and HIBP_API_KEY:
+                log("⟳", f"HIBP: {clean_domain(args.domain)}...")
+                futures["hibp"] = ex.submit(check_hibp, args.domain)
+            elif not args.no_hibp:
+                log("○", "HIBP: skipped — add HIBP_API_KEY to .env for breach history", "dim")
+
+            if not args.no_news and TAVILY_API_KEY:
+                log("⟳", f"News: searching '{args.company}'...")
+                futures["news"] = ex.submit(search_news, args.company)
+            elif not args.no_news:
+                log("○", "News: skipped — add TAVILY_API_KEY to .env for news intel", "dim")
+
+            # SSL runs separately (slow, needs live feedback)
             if not args.no_ssl:
-                status("⟳", f"SSL Labs: starting analysis of {args.domain} (60–90s)...")
+                log("⟳", f"SSL Labs: analysing {args.domain} — takes 60-90s...")
                 ssl_data = check_ssl(args.domain)
                 if "error" not in ssl_data:
-                    status("✓", f"SSL Labs: grade [bold]{ssl_data.get('grade')}[/bold]", "green")
+                    log("✓", f"SSL Labs: [bold]{ssl_data.get('grade')}[/bold]", "green")
                 else:
-                    status("✗", f"SSL Labs: {ssl_data['error']}", "yellow")
-            
-            # Collect parallel results
+                    log("✗", f"SSL Labs: {ssl_data['error']}", "yellow")
+            else:
+                log("○", "SSL Labs: skipped (--no-ssl)", "dim")
+
             for name, fut in futures.items():
                 try:
                     result = fut.result()
                     if name == "headers":
                         headers_data = result
                         if "error" not in result:
-                            status("✓", f"Security headers: grade [bold]{result.get('grade', 'Unknown')}[/bold]", "green")
+                            log("✓", f"Headers: [bold]{result.get('grade','?')}[/bold]", "green")
                         else:
-                            status("✗", f"Security headers: {result['error']}", "yellow")
+                            log("✗", f"Headers: {result['error']}", "yellow")
                     elif name == "hibp":
                         hibp_data = result
-                        count = result.get("count", 0)
                         if "error" not in result:
-                            style = "red" if count > 0 else "green"
-                            status("✓", f"HIBP: [{style}]{count} breach(es) found[/{style}]", style)
+                            n = result.get("count", 0)
+                            log("✓", f"HIBP: [{'red' if n else 'green'}]{n} breach(es)[/]",
+                                "red" if n else "green")
                         else:
-                            status("✗", f"HIBP: {result.get('error')}", "yellow")
+                            log("✗", f"HIBP: {result.get('error')}", "yellow")
                     elif name == "news":
                         news_data = result
-                        count = len(result.get("results", []))
                         if "error" not in result:
-                            status("✓", f"News: {count} results found", "green")
+                            log("✓", f"News: {len(result.get('results',[]))} results", "green")
                         else:
-                            status("✗", f"News: {result.get('error')}", "yellow")
+                            log("✗", f"News: {result.get('error')}", "yellow")
                 except Exception as e:
-                    status("✗", f"{name}: {e}", "yellow")
+                    log("✗", f"{name}: {e}", "yellow")
     else:
-        status("○", "No domain provided — skipping technical checks", "dim")
+        log("○", "No domain — skipping technical checks", "dim")
         if not args.no_news and TAVILY_API_KEY:
-            status("⟳", "News intelligence search starting...")
+            log("⟳", f"News: searching '{args.company}'...")
             news_data = search_news(args.company)
-            count = len((news_data or {}).get("results", []))
-            status("✓", f"News: {count} results found", "green")
+            log("✓", f"News: {len((news_data or {}).get('results',[]))} results", "green")
 
-    # ── AI Analysis ──
-    console.print()
-    console.print("[bold white]Running AI analysis...[/bold white]")
-    console.print("─" * 60, style="dim")
-    status("⟳", "Sending to Gemini 1.5 Pro...")
-    
-    user_message = build_user_message(
+    # ── AI analysis ────────────────────────────────────────────────────────
+    section(f"Running AI analysis  [{args.model}]")
+    log("⟳", "Sending to Ollama... (may take 30-120s depending on hardware)")
+
+    user_msg = build_user_message(
         args.company, args.domain,
-        ssl_data, headers_data, news_data, hibp_data,
-        doc_text
+        ssl_data, headers_data, news_data, hibp_data, doc_text,
     )
-    
+
     try:
-        report = analyse_with_gemini(user_message)
-        report["assessment_date"] = datetime.now().strftime("%d %B %Y")
-        report["_meta"] = {
-            "company": args.company,
-            "domain": args.domain,
-            "agent_version": "0.2",
-        }
-        status("✓", "Analysis complete", "green")
-    except Exception as e:
-        console.print(f"\n[red]Analysis failed: {e}[/red]")
+        report = analyse_with_ollama(user_msg, args.model)
+        report = sanitize_report(report)   # normalise all model output before rendering
+    except (ConnectionError, ValueError) as e:
+        console.print(f"\n[red]✗  {e}[/red]")
         sys.exit(1)
 
-    # ── Output ──
+    report["assessment_date"] = datetime.now().strftime("%d %B %Y")
+    report["_meta"] = {
+        "company": args.company,
+        "domain":  args.domain,
+        "model":   args.model,
+        "version": "0.2",
+        "phase":   "Phase 2 — Ollama Multi-Source Intelligence",
+    }
+    log("✓", "Analysis complete", "green")
+
+    # ── Output ─────────────────────────────────────────────────────────────
     if args.output in ("terminal", "both"):
-        render_report(report, args.company, args.domain or "")
+        render_report(report, args.company, args.domain or "", args.model)
 
     if args.output in ("json", "both"):
-        filename = f"{args.company.replace(' ', '_').lower()}_grc_v02_{datetime.now().strftime('%Y%m%d_%H%M')}.json"
-        with open(filename, "w") as f:
-            json.dump(report, f, indent=2)
-        console.print(f"\n  [green]✓[/green] Report saved: [bold]{filename}[/bold]")
+        ts       = datetime.now().strftime("%Y%m%d_%H%M")
+        slug     = args.company.lower().replace(" ", "_")
+        filename = f"{slug}_grc_v02_{ts}.json"
+        with open(filename, "w") as fh:
+            json.dump(report, fh, indent=2)
+        console.print(f"\n  [green]✓[/green]  Saved: [bold]{filename}[/bold]")
         console.print("  [dim]Pass this JSON to Phase 4 for PDF generation.[/dim]\n")
 
 
