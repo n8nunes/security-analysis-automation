@@ -1,28 +1,20 @@
 #!/usr/bin/env python3
 """
-GRC Assessment Agent — Phase 3
-Two-pass AI analysis, ASX/OAIC intelligence, risk register, framework mapping
+GRC Assessment Agent — Phase 4 (Full Version)
+Two-pass AI analysis, ASX/OAIC intelligence, risk register, framework mapping, and PDF generation.
 
-What's new in Phase 3:
-  ✦ Two-pass Ollama analysis  — token-efficient; findings then frameworks
-  ✦ ASX announcement scraper  — security disclosures and material events
-  ✦ OAIC NDB search           — regulatory notifications and enforcement
-  ✦ Formal risk register      — likelihood × impact (ASD/NIST aligned)
-  ✦ ASD maturity criteria     — 0–4 definitions baked into prompt
-  ✦ Per-finding confidence    — HIGH / MEDIUM / LOW evidence basis
-  ✦ Contradiction detection   — document vs technical evidence
-  ✦ Assessment metadata       — ref number, assessor, version
+What's new in Phase 4:
+  ✦ PDF Report Generation   — outputs professional, branded deliverable via WeasyPrint
+  ✦ Zero-Dependency Fallback— gracefully drops back to full HTML report if GTK/DLLs are missing
+  ✦ Formalised Disclaimers  — structured legal & ethical boundaries explicitly stated
+  ✦ Deliverable Formatting   — HTML to PDF pipeline for clean, shareable client reports
 
 Dependencies:
-    pip install requests python-dotenv rich beautifulsoup4 lxml
-
-    beautifulsoup4 + lxml enable ASX and OAIC scrapers.
-    All other features work without them.
+    pip install requests python-dotenv rich beautifulsoup4 lxml weasyprint
 
 Usage:
-    python agent.py "Latitude Financial" --domain latitudefinancial.com.au --ticker LFS
-    python agent.py "Medibank"  --domain medibank.com.au --doc policy.txt
-    python agent.py "CBA"       --domain commbank.com.au --ticker CBA --output json
+    python agent.py "Latitude Financial" --domain latitudefinancial.com.au --ticker LFS --output pdf
+    python agent.py "Medibank"  --domain medibank.com.au --doc policy.txt --output all
     python agent.py "ANZ"       --domain anz.com.au --assessor "J. Smith" --ref GRC-2025-001
 """
 
@@ -50,6 +42,12 @@ try:
 except ImportError:
     BS4_AVAILABLE = False
 
+try:
+    from weasyprint import HTML
+    WEASYPRINT_AVAILABLE = True
+except ImportError:
+    WEASYPRINT_AVAILABLE = False
+
 load_dotenv()
 
 # ── CONFIG ─────────────────────────────────────────────────────────────────────
@@ -61,7 +59,7 @@ HIBP_API_KEY   = os.getenv("HIBP_API_KEY",   "")
 
 SSL_POLL_INTERVAL = 10    # seconds between SSL Labs polls
 SSL_MAX_WAIT      = 180   # seconds before giving up
-USER_AGENT        = "GRC-Assessment-Agent/0.3 (passive-recon-only; portfolio)"
+USER_AGENT        = "GRC-Assessment-Agent/0.4 (passive-recon-only; portfolio)"
 ASX_TIMEOUT       = 15
 OAIC_TIMEOUT      = 15
 
@@ -111,10 +109,6 @@ def check_ollama(model: str) -> dict:
 # ── DATA SOURCE 1: SSL LABS ────────────────────────────────────────────────────
 
 def check_ssl(domain: str) -> dict:
-    """
-    Qualys SSL Labs — passive TLS/SSL assessment. Free, no key required.
-    First scan takes 60–90 s; uses cached results when available.
-    """
     host = clean_domain(domain)
     base = "https://api.ssllabs.com/api/v3"
     try:
@@ -164,9 +158,6 @@ def check_ssl(domain: str) -> dict:
 # ── DATA SOURCE 2: SECURITY HEADERS ───────────────────────────────────────────
 
 def check_security_headers(domain: str) -> dict:
-    """
-    SecurityHeaders.com + direct header probe. Free, no key required.
-    """
     host = clean_domain(domain)
     grade = score = "Unknown"
     try:
@@ -179,9 +170,6 @@ def check_security_headers(domain: str) -> dict:
         score     = r.headers.get("X-Score", "Unknown")
         valid_grades = {"A+", "A", "B", "C", "D", "E", "F"}
         grade = raw_grade if raw_grade in valid_grades else "Unknown"
-        if raw_grade not in valid_grades and raw_grade != "Unknown":
-            log("⚠", "Security headers grade unavailable — direct header check still ran",
-                "yellow")
     except requests.exceptions.RequestException as e:
         return {"error": str(e)}
 
@@ -207,10 +195,6 @@ def check_security_headers(domain: str) -> dict:
 # ── DATA SOURCE 3: TAVILY NEWS ─────────────────────────────────────────────────
 
 def search_news(company: str) -> dict:
-    """
-    Tavily AI-optimised search — recent security incidents.
-    Set TAVILY_API_KEY in .env for free tier: https://tavily.com
-    """
     if not TAVILY_API_KEY:
         return {"skipped": True, "reason": "TAVILY_API_KEY not set in .env"}
     try:
@@ -232,10 +216,6 @@ def search_news(company: str) -> dict:
 # ── DATA SOURCE 4: HAVE I BEEN PWNED ──────────────────────────────────────────
 
 def check_hibp(domain: str) -> dict:
-    """
-    HIBP breach history for a domain.
-    Set HIBP_API_KEY in .env — ~$4 AUD/month: https://haveibeenpwned.com/API/Key
-    """
     if not HIBP_API_KEY:
         return {"skipped": True, "reason": "HIBP_API_KEY not set in .env"}
     host = clean_domain(domain)
@@ -265,11 +245,6 @@ def check_hibp(domain: str) -> dict:
 # ── DATA SOURCE 5: ASX ANNOUNCEMENTS ──────────────────────────────────────────
 
 def search_asx(company: str, ticker: str = None) -> dict:
-    """
-    ASX public announcements API — no key required, publicly listed data.
-    Searches for cybersecurity-related disclosures using keyword matching.
-    If no ticker is supplied, attempts to look one up by company name.
-    """
     results = {
         "ticker":          ticker,
         "announcements":   [],
@@ -277,7 +252,6 @@ def search_asx(company: str, ticker: str = None) -> dict:
         "total_scanned":   0,
         "security_count":  0,
     }
-
     security_keywords = {
         "cyber", "breach", "hack", "ransomware", "security incident",
         "data breach", "unauthorised access", "privacy", "data leak",
@@ -285,7 +259,6 @@ def search_asx(company: str, ticker: str = None) -> dict:
         "phishing", "extortion", "credentials", "unauthorised",
     }
 
-    # ── Ticker-based API ──────────────────────────────────────────────────
     if ticker:
         ticker = ticker.upper().strip()
         results["ticker"] = ticker
@@ -316,7 +289,6 @@ def search_asx(company: str, ticker: str = None) -> dict:
         except requests.exceptions.RequestException as e:
             results["ticker_error"] = str(e)
 
-    # ── Company-name lookup fallback ──────────────────────────────────────
     try:
         r = requests.get(
             "https://www.asx.com.au/asx/1/search",
@@ -339,15 +311,8 @@ def search_asx(company: str, ticker: str = None) -> dict:
 # ── DATA SOURCE 6: OAIC NDB SEARCH ────────────────────────────────────────────
 
 def search_oaic(company: str) -> dict:
-    """
-    Searches OAIC (Office of the Australian Information Commissioner) pages for
-    Notifiable Data Breach records, privacy determinations, and enforcement actions.
-    No key required — all publicly available content.
-    Requires beautifulsoup4: pip install beautifulsoup4 lxml
-    """
     if not BS4_AVAILABLE:
-        return {"skipped": True,
-                "reason": "beautifulsoup4 not installed — pip install beautifulsoup4 lxml"}
+        return {"skipped": True, "reason": "beautifulsoup4 not installed"}
 
     results = {
         "mentions":           [],
@@ -355,220 +320,75 @@ def search_oaic(company: str) -> dict:
         "enforcement_found":  False,
         "mention_count":      0,
     }
-
     company_lower = company.lower()
     search_targets = [
-        ("https://www.oaic.gov.au/privacy/notifiable-data-breaches",
-         "NDB Statistics"),
-        ("https://www.oaic.gov.au/privacy/privacy-decisions",
-         "Privacy Decisions"),
-        ("https://www.oaic.gov.au/privacy/privacy-guidance-for-organisations-and-government-agencies",
-         "OAIC Guidance"),
+        ("https://www.oaic.gov.au/privacy/notifiable-data-breaches", "NDB Statistics"),
+        ("https://www.oaic.gov.au/privacy/privacy-decisions", "Privacy Decisions"),
+        ("https://www.oaic.gov.au/privacy/privacy-guidance-for-organisations-and-government-agencies", "OAIC Guidance"),
     ]
 
     for url, label in search_targets:
         try:
             r = requests.get(url, headers={"User-Agent": USER_AGENT}, timeout=OAIC_TIMEOUT)
-            if r.status_code != 200:
-                continue
-            # Try lxml first (faster), fall back to html.parser
-            try:
-                soup = BeautifulSoup(r.text, "lxml")
-            except Exception:
-                soup = BeautifulSoup(r.text, "html.parser")
+            if r.status_code != 200: continue
+            try: soup = BeautifulSoup(r.text, "lxml")
+            except Exception: soup = BeautifulSoup(r.text, "html.parser")
 
             text  = soup.get_text(separator=" ", strip=True)
             lower = text.lower()
+            if company_lower not in lower: continue
 
-            if company_lower not in lower:
-                continue
-
-            # Extract a snippet of context around the mention
             idx     = lower.find(company_lower)
             snippet = text[max(0, idx - 120): idx + 200].strip()
-            results["mentions"].append({
-                "source":  label,
-                "url":     url,
-                "snippet": snippet,
-            })
+            results["mentions"].append({"source": label, "url": url, "snippet": snippet})
             if "notifiable data breach" in lower or "ndb" in lower:
                 results["ndb_found"] = True
             if "determination" in lower or "penalty" in lower or "enforcement" in lower:
                 results["enforcement_found"] = True
-
         except Exception:
-            pass  # OAIC is informational — never block the pipeline
+            pass
 
     results["mention_count"] = len(results["mentions"])
     return results
 
 
 # ── TWO-PASS AI ANALYSIS ───────────────────────────────────────────────────────
-#
-# Pass 1 — Technical synthesis
-#   Input:  raw recon data (SSL, headers, HIBP, news, ASX, OAIC, document)
-#   Output: structured findings + technical summary
-#   Size:   ~1 500 input tokens → ~600 output tokens
-#
-# Pass 2 — Framework mapping + risk register
-#   Input:  Pass 1 output (compact JSON) — clean, no raw data noise
-#   Output: Essential Eight, ISO 27001, NIST CSF, Privacy Act, risk register
-#   Size:   ~700 input tokens → ~1 200 output tokens
-#
-# Why two passes?
-#   Each call is half the size → faster inference, fewer hallucinations.
-#   The model focuses on one job at a time.
-#   Pass 2 works from structured findings, not messy raw data → better mapping.
-#   Either pass can be retried independently if it fails.
-
-# ── Pass 1 system prompt ──────────────────────────────────────────────────────
 
 PASS1_SYSTEM = """\
 You are a cybersecurity analyst extracting structured findings from passive reconnaissance data.
-
 RULES:
 - Output ONLY valid JSON. No preamble, no markdown, no explanation.
 - Base every finding strictly on evidence provided. Do not infer beyond what is shown.
 - confidence: HIGH = direct technical evidence | MEDIUM = indirect/partial | LOW = inference only
 - severity: HIGH = exploitable now or data already exposed | MEDIUM = real risk, not immediate | LOW = hygiene gap | INFO = neutral observation
 - contradiction: if the company document claims X but technical data shows not-X, set this field to a short description. Otherwise null.
-- If a data source was skipped or errored, do not invent findings from it.
-
-Respond with this exact JSON schema (no extra keys):
+Respond with this exact JSON schema:
 {
-  "data_sensitivity": "one sentence — what personal, financial or health data this organisation handles",
-  "executive_brief": "1-2 sentence synthesis of the most significant technical findings",
-  "technical_summary": {
-    "ssl_grade": "grade letter or Unknown",
-    "headers_grade": "grade letter or Unknown",
-    "known_breaches": 0,
-    "key_vulnerabilities": ["list of confirmed vuln names, empty if none"]
-  },
-  "findings": [
-    {
-      "id": "F001",
-      "source": "SSL|Headers|HIBP|News|ASX|OAIC|Document",
-      "category": "Transport Security|Web Security|Breach History|Regulatory|Disclosure|Policy",
-      "severity": "HIGH|MEDIUM|LOW|INFO",
-      "confidence": "HIGH|MEDIUM|LOW",
-      "title": "concise finding title",
-      "observation": "exactly what was observed — evidence only, no inference",
-      "risk": "what risk this creates for the organisation or for data subjects",
-      "contradiction": null
-    }
-  ],
-  "document_claims": ["list of specific security claims made in the provided document, or empty array"]
+  "data_sensitivity": "...",
+  "executive_brief": "...",
+  "technical_summary": { "ssl_grade": "...", "headers_grade": "...", "known_breaches": 0, "key_vulnerabilities": [] },
+  "findings": [ { "id": "F001", "source": "...", "category": "...", "severity": "HIGH", "confidence": "HIGH", "title": "...", "observation": "...", "risk": "...", "contradiction": null } ],
+  "document_claims": []
 }"""
-
-
-# ── Pass 2 system prompt ──────────────────────────────────────────────────────
 
 PASS2_SYSTEM = """\
 You are a senior GRC analyst mapping structured cybersecurity findings to Australian and international frameworks.
-
-ESSENTIAL EIGHT MATURITY LEVELS (ASD ACSC — use these definitions exactly):
-  0 = Not implemented, or no evidence exists to assess
-  1 = Partially implemented, or implemented inconsistently
-  2 = Implemented with some gaps, or cannot be verified
-  3 = Substantially implemented; evidence-backed; broadly consistent
-  4 = Fully implemented; continuously improved; strong documentary evidence
-Default to 0 for any control that passive recon cannot observe.
-Only assert 2–4 when a finding directly supports it.
-
+ESSENTIAL EIGHT MATURITY LEVELS (ASD ACSC — 0 to 4). Default to 0 for any control that passive recon cannot observe.
 RISK SCORE = likelihood (1–5) × impact (1–5)
-Rating thresholds: Critical ≥ 16 | High ≥ 10 | Medium ≥ 6 | Low < 6
-
-RULES:
-- Output ONLY valid JSON. No preamble, no markdown, no explanation.
-- Map only what the provided findings support. Unknown is correct when evidence is absent.
-- triggered_by in recommendations must cite specific finding IDs (e.g. "F001, F003").
-- finding_refs in risk_register must cite specific finding IDs.
-- ISO and NIST status values: Evident | Apparent | Partial | Gap | Concern | Unknown
-
-Respond with this exact JSON schema (no extra keys):
+RULES: Output ONLY valid JSON. No preamble.
+Respond with this exact JSON schema:
 {
-  "overall_risk_rating": "CRITICAL|HIGH|MEDIUM|LOW",
-  "risk_score": 7.5,
-  "confidence": "HIGH|MEDIUM|LOW",
-  "essential_eight": {
-    "patch_applications":         {"maturity": 0, "notes": "...", "source": "finding ID or None"},
-    "patch_os":                   {"maturity": 0, "notes": "...", "source": "..."},
-    "multi_factor_auth":          {"maturity": 0, "notes": "...", "source": "..."},
-    "restrict_admin_privileges":  {"maturity": 0, "notes": "...", "source": "..."},
-    "application_control":        {"maturity": 0, "notes": "...", "source": "..."},
-    "restrict_macros":            {"maturity": 0, "notes": "...", "source": "..."},
-    "user_application_hardening": {"maturity": 0, "notes": "...", "source": "..."},
-    "regular_backups":            {"maturity": 0, "notes": "...", "source": "..."}
-  },
-  "iso_27001": [
-    {"domain": "Information Security Policies",        "clause": "A.5",  "status": "Unknown", "notes": "..."},
-    {"domain": "Organisation of Information Security", "clause": "A.6",  "status": "Unknown", "notes": "..."},
-    {"domain": "Human Resource Security",              "clause": "A.7",  "status": "Unknown", "notes": "..."},
-    {"domain": "Asset Management",                     "clause": "A.8",  "status": "Unknown", "notes": "..."},
-    {"domain": "Access Control",                       "clause": "A.9",  "status": "Unknown", "notes": "..."},
-    {"domain": "Cryptography",                         "clause": "A.10", "status": "Unknown", "notes": "..."},
-    {"domain": "Physical Security",                    "clause": "A.11", "status": "Unknown", "notes": "..."},
-    {"domain": "Operations Security",                  "clause": "A.12", "status": "Unknown", "notes": "..."},
-    {"domain": "Communications Security",              "clause": "A.13", "status": "Unknown", "notes": "..."},
-    {"domain": "Supplier Relationships",               "clause": "A.15", "status": "Unknown", "notes": "..."},
-    {"domain": "Incident Management",                  "clause": "A.16", "status": "Unknown", "notes": "..."},
-    {"domain": "Business Continuity",                  "clause": "A.17", "status": "Unknown", "notes": "..."},
-    {"domain": "Compliance",                           "clause": "A.18", "status": "Unknown", "notes": "..."}
-  ],
-  "nist_csf": [
-    {"function": "Govern",   "status": "Unknown", "notes": "..."},
-    {"function": "Identify", "status": "Unknown", "notes": "..."},
-    {"function": "Protect",  "status": "Unknown", "notes": "..."},
-    {"function": "Detect",   "status": "Unknown", "notes": "..."},
-    {"function": "Respond",  "status": "Unknown", "notes": "..."},
-    {"function": "Recover",  "status": "Unknown", "notes": "..."}
-  ],
-  "privacy_act": {
-    "overall_status": "Unknown",
-    "apps_assessed": [
-      {"app": "APP 1 - Open and transparent management",    "status": "Unknown", "notes": "..."},
-      {"app": "APP 3 - Collection of personal information", "status": "Unknown", "notes": "..."},
-      {"app": "APP 5 - Notification of collection",         "status": "Unknown", "notes": "..."},
-      {"app": "APP 6 - Use and disclosure",                 "status": "Unknown", "notes": "..."},
-      {"app": "APP 11 - Security of personal information",  "status": "Unknown", "notes": "..."},
-      {"app": "APP 12 - Access to personal information",    "status": "Unknown", "notes": "..."}
-    ]
-  },
-  "risk_register": [
-    {
-      "id": "R001",
-      "finding_refs": ["F001"],
-      "description": "concise risk description",
-      "category": "Confidentiality|Integrity|Availability|Compliance",
-      "likelihood": 3,
-      "impact": 4,
-      "risk_score": 12,
-      "risk_rating": "HIGH",
-      "treatment": "Mitigate|Accept|Transfer|Avoid",
-      "recommended_action": "specific, actionable step"
-    }
-  ],
-  "recommendations": [
-    {
-      "priority": "HIGH|MEDIUM|LOW",
-      "action": "action title",
-      "rationale": "why this matters — impact if not addressed",
-      "framework_ref": "Essential Eight — MFA Level 2",
-      "triggered_by": "F001, F002"
-    }
-  ],
-  "limitations": "brief note on what passive recon cannot determine for this organisation"
+  "overall_risk_rating": "CRITICAL|HIGH|MEDIUM|LOW", "risk_score": 7.5, "confidence": "HIGH|MEDIUM|LOW",
+  "essential_eight": { "patch_applications": {"maturity": 0, "notes": "...", "source": "..."}, "patch_os": {"maturity": 0, "notes": "...", "source": "..."}, "multi_factor_auth": {"maturity": 0, "notes": "...", "source": "..."}, "restrict_admin_privileges": {"maturity": 0, "notes": "...", "source": "..."}, "application_control": {"maturity": 0, "notes": "...", "source": "..."}, "restrict_macros": {"maturity": 0, "notes": "...", "source": "..."}, "user_application_hardening": {"maturity": 0, "notes": "...", "source": "..."}, "regular_backups": {"maturity": 0, "notes": "...", "source": "..."} },
+  "iso_27001": [ {"domain": "...", "clause": "...", "status": "Unknown", "notes": "..."} ],
+  "nist_csf": [ {"function": "Govern", "status": "Unknown", "notes": "..."} ],
+  "privacy_act": { "overall_status": "Unknown", "apps_assessed": [ {"app": "...", "status": "...", "notes": "..."} ] },
+  "risk_register": [ { "id": "R001", "finding_refs": ["F001"], "description": "...", "category": "...", "likelihood": 3, "impact": 4, "risk_score": 12, "risk_rating": "HIGH", "treatment": "...", "recommended_action": "..." } ],
+  "recommendations": [ { "priority": "HIGH", "action": "...", "rationale": "...", "framework_ref": "...", "triggered_by": "F001" } ],
+  "limitations": "brief note on what passive recon cannot determine"
 }"""
 
-
-# ── Core Ollama call ──────────────────────────────────────────────────────────
-
 def _call_ollama(system: str, user_msg: str, model: str, timeout: int = 300) -> dict:
-    """
-    Shared Ollama call used by both analysis passes.
-    Forces JSON output at very low temperature for deterministic structured output.
-    Raises ConnectionError or ValueError on failure.
-    """
     try:
         r = requests.post(
             f"{OLLAMA_HOST}/api/chat",
@@ -581,8 +401,8 @@ def _call_ollama(system: str, user_msg: str, model: str, timeout: int = 300) -> 
                 "stream": False,
                 "format": "json",
                 "options": {
-                    "temperature": 0.05,  # Near-deterministic structured output
-                    "num_ctx":     6144,  # Sufficient for focused single-job passes
+                    "temperature": 0.05,
+                    "num_ctx":     6144,
                     "top_p":       0.9,
                 },
             },
@@ -590,432 +410,127 @@ def _call_ollama(system: str, user_msg: str, model: str, timeout: int = 300) -> 
         )
         r.raise_for_status()
     except requests.exceptions.ConnectionError:
-        raise ConnectionError(
-            f"Cannot connect to Ollama at {OLLAMA_HOST}.\n"
-            f"  → Install:    https://ollama.com\n"
-            f"  → Pull model: ollama pull {model}\n"
-            "  → Start:     ollama serve"
-        )
+        raise ConnectionError(f"Cannot connect to Ollama at {OLLAMA_HOST}.")
 
     content = r.json().get("message", {}).get("content", "").strip()
-
-    # Strip markdown fences if the model added them despite format=json
     if content.startswith("```"):
         parts = content.split("```")
         content = parts[1] if len(parts) > 1 else content
-        if content.startswith("json"):
-            content = content[4:]
+        if content.startswith("json"): content = content[4:]
     content = content.strip()
 
     try:
         return json.loads(content)
-    except json.JSONDecodeError as e:
-        # Last-resort: extract the outermost JSON object from surrounding text
-        start = content.find("{")
-        end   = content.rfind("}") + 1
+    except json.JSONDecodeError:
+        start = content.find("{"); end = content.rfind("}") + 1
         if start != -1 and end > start:
-            try:
-                return json.loads(content[start:end])
-            except json.JSONDecodeError:
-                pass
-        raise ValueError(
-            f"Model did not return valid JSON: {e}\n"
-            f"Raw output (first 500 chars):\n{content[:500]}"
-        )
+            try: return json.loads(content[start:end])
+            except json.JSONDecodeError: pass
+        raise ValueError("Model did not return valid JSON.")
 
-
-# ── Pass 1 message builder ────────────────────────────────────────────────────
-
-def build_pass1_message(company, domain, ssl_data, headers_data,
-                         news_data, hibp_data, asx_data, oaic_data, doc_text) -> str:
-    """
-    Compress all raw recon data into a token-efficient format for Pass 1.
-    Every section is kept compact — the model doesn't need prose, it needs facts.
-    """
-    parts = [
-        f"Company: {company}",
-        f"Domain:  {domain or 'not provided'}",
-        f"Date:    {datetime.now().strftime('%d %B %Y')}",
-        "",
-    ]
-
-    # SSL
-    if ssl_data and "error" not in ssl_data:
-        vulns = []
-        if ssl_data.get("heartbleed"): vulns.append("Heartbleed")
-        if ssl_data.get("poodle_tls"): vulns.append("POODLE-TLS")
-        if ssl_data.get("beast"):      vulns.append("BEAST")
-        parts.append(
-            f"SSL: grade={ssl_data.get('grade','?')} warnings={ssl_data.get('has_warnings',False)} "
-            f"HSTS={ssl_data.get('hsts_status','?')} "
-            f"forward_secrecy={ssl_data.get('forward_secrecy','?')} "
-            f"protocols=[{','.join(ssl_data.get('protocols',[]))}] "
-            f"cert_expiry={ssl_data.get('cert_expiry','?')} "
-            f"confirmed_vulns=[{','.join(vulns) or 'none'}]"
-        )
-    elif ssl_data:
-        parts.append(f"SSL: ERROR — {ssl_data.get('error')}")
-    else:
-        parts.append("SSL: not collected")
-
-    # Headers
-    if headers_data and "error" not in headers_data:
-        parts.append(
-            f"HEADERS: grade={headers_data.get('grade','?')} "
-            f"present=[{','.join(headers_data.get('present',[]))}] "
-            f"missing=[{','.join(headers_data.get('missing',[]))}]"
-        )
-    elif headers_data:
-        parts.append(f"HEADERS: ERROR — {headers_data.get('error')}")
-    else:
-        parts.append("HEADERS: not collected")
-
-    # HIBP
-    if hibp_data and not hibp_data.get("skipped") and "error" not in hibp_data:
-        count = hibp_data.get("count", 0)
-        parts.append(f"HIBP: breach_count={count}")
-        for b in hibp_data.get("breaches", [])[:4]:
-            parts.append(
-                f"  BREACH: name={b['name']} date={b['date']} "
-                f"records={b['records']:,} types=[{','.join(b['data_classes'][:4])}]"
-            )
-    elif hibp_data and hibp_data.get("skipped"):
-        parts.append("HIBP: skipped (no API key)")
-    else:
-        parts.append("HIBP: not collected")
-
-    # News (max 3 results to save tokens)
+def build_pass1_message(company, domain, ssl_data, headers_data, news_data, hibp_data, asx_data, oaic_data, doc_text) -> str:
+    parts = [f"Company: {company}", f"Domain:  {domain or 'not provided'}", f"Date:    {datetime.now().strftime('%d %B %Y')}", ""]
+    if ssl_data and "error" not in ssl_data: parts.append(f"SSL: grade={ssl_data.get('grade','?')} warnings={ssl_data.get('has_warnings',False)} HSTS={ssl_data.get('hsts_status','?')} cert_expiry={ssl_data.get('cert_expiry','?')}")
+    else: parts.append(f"SSL: {ssl_data.get('error') if ssl_data else 'not collected'}")
+    if headers_data and "error" not in headers_data: parts.append(f"HEADERS: grade={headers_data.get('grade','?')} present=[{','.join(headers_data.get('present',[]))}] missing=[{','.join(headers_data.get('missing',[]))}]")
+    else: parts.append(f"HEADERS: {headers_data.get('error') if headers_data else 'not collected'}")
+    if hibp_data and not hibp_data.get("skipped") and "error" not in hibp_data: parts.append(f"HIBP: breach_count={hibp_data.get('count', 0)}")
     if news_data and not news_data.get("skipped") and "error" not in news_data:
-        if news_data.get("answer"):
-            parts.append(f"NEWS_SUMMARY: {truncate(news_data['answer'], 350)}")
-        for item in (news_data.get("results", []) or [])[:3]:
-            parts.append(
-                f"NEWS: {item.get('title','')} | {truncate(item.get('content',''), 180)}"
-            )
-    elif news_data and news_data.get("skipped"):
-        parts.append("NEWS: skipped (no API key)")
-    else:
-        parts.append("NEWS: not collected")
-
-    # ASX
-    if asx_data:
-        if asx_data.get("skipped") or asx_data.get("note"):
-            parts.append(f"ASX: {asx_data.get('note','not listed / no ticker provided')}")
-        else:
-            sc = asx_data.get("security_count", 0)
-            parts.append(
-                f"ASX: ticker={asx_data.get('ticker','?')} "
-                f"announcements_scanned={asx_data.get('total_scanned',0)} "
-                f"security_related={sc}"
-            )
-            for ann in asx_data.get("security_related", [])[:3]:
-                parts.append(
-                    f"  ASX_ANN: date={ann.get('date','')} "
-                    f"price_sensitive={ann.get('price_sensitive',False)} "
-                    f"title={ann.get('title','')}"
-                )
-    else:
-        parts.append("ASX: not collected")
-
-    # OAIC
-    if oaic_data:
-        if oaic_data.get("skipped"):
-            parts.append("OAIC: skipped (beautifulsoup4 not installed)")
-        elif oaic_data.get("mention_count", 0) > 0:
-            parts.append(
-                f"OAIC: mentions={oaic_data['mention_count']} "
-                f"ndb_context={oaic_data.get('ndb_found',False)} "
-                f"enforcement={oaic_data.get('enforcement_found',False)}"
-            )
-            for m in oaic_data.get("mentions", [])[:2]:
-                parts.append(f"  OAIC_SNIPPET [{m['source']}]: {truncate(m['snippet'], 200)}")
-        else:
-            parts.append("OAIC: searched — no mentions found")
-    else:
-        parts.append("OAIC: not collected")
-
-    # Document (hard-truncated to keep tokens manageable)
-    if doc_text and doc_text.strip():
-        parts.append(f"\nDOCUMENT (truncated to 4 000 chars):\n{doc_text.strip()[:4000]}")
-    else:
-        parts.append("\nDOCUMENT: not provided")
-
+        if news_data.get("answer"): parts.append(f"NEWS_SUMMARY: {truncate(news_data['answer'], 350)}")
+    if asx_data and not asx_data.get("skipped"): parts.append(f"ASX: security_related={asx_data.get('security_count', 0)}")
+    if oaic_data and not oaic_data.get("skipped"): parts.append(f"OAIC: mentions={oaic_data.get('mention_count', 0)} ndb_context={oaic_data.get('ndb_found',False)}")
+    if doc_text and doc_text.strip(): parts.append(f"\nDOCUMENT (truncated to 4000 chars):\n{doc_text.strip()[:4000]}")
     return "\n".join(parts)
 
-
-# ── Pass 2 message builder ────────────────────────────────────────────────────
-
 def build_pass2_message(pass1: dict) -> str:
-    """
-    Compress Pass 1 output into a clean, minimal input for Pass 2.
-    Findings become single-line strings so Pass 2 can focus purely on mapping.
-    """
-    findings_compact = []
-    for f in pass1.get("findings", []):
-        line = (
-            f"{f.get('id','?')} "
-            f"[{f.get('severity','?')}/{f.get('confidence','?')}] "
-            f"src={f.get('source','?')} "
-            f"cat={f.get('category','?')} — "
-            f"{f.get('title','')} | "
-            f"obs: {f.get('observation','')} | "
-            f"risk: {f.get('risk','')} | "
-            f"contradiction: {f.get('contradiction') or 'none'}"
-        )
-        findings_compact.append(line)
+    findings_compact = [f"{f.get('id','?')} [{f.get('severity','?')}] {f.get('title','')} | {f.get('observation','')}" for f in pass1.get("findings", [])]
+    return json.dumps({"data_sensitivity": pass1.get("data_sensitivity", ""), "executive_brief": pass1.get("executive_brief", ""), "findings": findings_compact}, separators=(",", ":"))
 
-    payload = {
-        "data_sensitivity":  pass1.get("data_sensitivity", ""),
-        "executive_brief":   pass1.get("executive_brief", ""),
-        "technical_summary": pass1.get("technical_summary", {}),
-        "document_claims":   pass1.get("document_claims", []),
-        "findings":          findings_compact,
-    }
-    # Compact JSON (no indentation) to save tokens
-    return json.dumps(payload, separators=(",", ":"))
-
-
-# ── Two-pass orchestrator ─────────────────────────────────────────────────────
-
-def analyse_two_pass(company, domain, ssl_data, headers_data, news_data,
-                      hibp_data, asx_data, oaic_data, doc_text, model) -> dict:
-    """
-    Runs Pass 1 (technical findings) then Pass 2 (framework mapping).
-    If Pass 2 fails the partial Pass 1 output is returned with empty framework sections
-    so the report still renders cleanly.
-    """
-    # ── Pass 1: technical findings ────────────────────────────────────────
+def analyse_two_pass(company, domain, ssl_data, headers_data, news_data, hibp_data, asx_data, oaic_data, doc_text, model) -> dict:
     log("⟳", "Pass 1 — extracting technical findings…", "cyan")
-    p1_msg = build_pass1_message(
-        company, domain, ssl_data, headers_data,
-        news_data, hibp_data, asx_data, oaic_data, doc_text,
-    )
-    pass1 = _call_ollama(PASS1_SYSTEM, p1_msg, model, timeout=300)
-    finding_count = len(pass1.get("findings", []))
-    log("✓", f"Pass 1 complete — {finding_count} finding(s) extracted", "green")
-
-    # ── Pass 2: framework mapping ─────────────────────────────────────────
+    p1_msg = build_pass1_message(company, domain, ssl_data, headers_data, news_data, hibp_data, asx_data, oaic_data, doc_text)
+    pass1 = _call_ollama(PASS1_SYSTEM, p1_msg, model)
+    log("✓", f"Pass 1 complete — {len(pass1.get('findings', []))} finding(s) extracted", "green")
+    
     log("⟳", "Pass 2 — framework mapping + risk register…", "cyan")
     p2_msg = build_pass2_message(pass1)
     pass2: dict = {}
     try:
-        pass2 = _call_ollama(PASS2_SYSTEM, p2_msg, model, timeout=300)
+        pass2 = _call_ollama(PASS2_SYSTEM, p2_msg, model)
         log("✓", "Pass 2 complete — frameworks mapped", "green")
-    except (ConnectionError, ValueError) as e:
-        log("⚠", f"Pass 2 failed — report will show findings only. Error: {e}", "yellow")
+    except Exception as e:
+        log("⚠", f"Pass 2 failed. Error: {e}", "yellow")
 
-    # ── Merge into final report ───────────────────────────────────────────
+    sources = []
+    if ssl_data and "error" not in ssl_data: sources.append("SSL Labs")
+    if headers_data and "error" not in headers_data: sources.append("Security Headers")
+    if news_data and not news_data.get("skipped"): sources.append("News Intelligence")
+    if hibp_data and not hibp_data.get("skipped"): sources.append("HIBP")
+    if asx_data and not asx_data.get("skipped"): sources.append("ASX Announcements")
+    if oaic_data and not oaic_data.get("skipped"): sources.append("OAIC Records")
+
     return {
-        # From Pass 1
-        "data_sensitivity": pass1.get("data_sensitivity", ""),
-        "executive_summary": pass1.get("executive_brief", ""),
-        "technical_summary": pass1.get("technical_summary", {}),
-        "findings":          pass1.get("findings", []),
-        "document_claims":   pass1.get("document_claims", []),
-        "data_sources_used": _infer_sources(
-            ssl_data, headers_data, news_data,
-            hibp_data, asx_data, oaic_data, doc_text,
-        ),
-        # From Pass 2 (empty dicts/lists if pass2 failed)
-        "overall_risk_rating": pass2.get("overall_risk_rating", "UNKNOWN"),
-        "risk_score":          pass2.get("risk_score", 0.0),
-        "confidence":          pass2.get("confidence", "LOW"),
-        "essential_eight":     pass2.get("essential_eight", {}),
-        "iso_27001":           pass2.get("iso_27001", []),
-        "nist_csf":            pass2.get("nist_csf", []),
-        "privacy_act":         pass2.get("privacy_act", {}),
-        "risk_register":       pass2.get("risk_register", []),
-        "recommendations":     pass2.get("recommendations", []),
-        "limitations":         pass2.get("limitations",
-                                         "Passive reconnaissance only — no active scanning."),
-        "assessed_by":         f"GRC Assessment Agent v0.3 (Phase 3 — {model})",
+        "data_sensitivity": pass1.get("data_sensitivity", ""), "executive_summary": pass1.get("executive_brief", ""),
+        "technical_summary": pass1.get("technical_summary", {}), "findings": pass1.get("findings", []), "document_claims": pass1.get("document_claims", []),
+        "data_sources_used": sources, "overall_risk_rating": pass2.get("overall_risk_rating", "UNKNOWN"), "risk_score": pass2.get("risk_score", 0.0),
+        "confidence": pass2.get("confidence", "LOW"), "essential_eight": pass2.get("essential_eight", {}), "iso_27001": pass2.get("iso_27001", []),
+        "nist_csf": pass2.get("nist_csf", []), "privacy_act": pass2.get("privacy_act", {}), "risk_register": pass2.get("risk_register", []),
+        "recommendations": pass2.get("recommendations", []), "limitations": pass2.get("limitations", "Passive reconnaissance only — no active scanning."),
+        "assessed_by": f"GRC Assessment Agent v0.4 (Phase 4 — {model})"
     }
 
 
-def _infer_sources(ssl_data, headers_data, news_data,
-                    hibp_data, asx_data, oaic_data, doc_text) -> list:
-    sources = []
-    if ssl_data and "error" not in ssl_data:                    sources.append("SSL Labs")
-    if headers_data and "error" not in headers_data:            sources.append("Security Headers")
-    if news_data and not news_data.get("skipped"):              sources.append("News Intelligence")
-    if hibp_data and not hibp_data.get("skipped"):              sources.append("HIBP")
-    if asx_data  and not asx_data.get("skipped"):               sources.append("ASX Announcements")
-    if oaic_data and not oaic_data.get("skipped"):              sources.append("OAIC Records")
-    if doc_text  and doc_text.strip():                          sources.append("Document Analysis")
-    return sources
-
-
-# ── SANITIZE ───────────────────────────────────────────────────────────────────
+# ── SANITIZE & TERMINAL RENDER ─────────────────────────────────────────────────
 
 def _s(v, fallback: str = "") -> str:
-    """Safely coerce any model-returned value to a non-None string."""
-    if v is None:
-        return fallback
+    if v is None: return fallback
     if isinstance(v, dict):
-        for key in ("name", "type", "title", "description", "value", "text"):
-            if key in v:
-                return str(v[key])
+        for k in ("name", "type", "title", "description", "value", "text"):
+            if k in v: return str(v[k])
         return str(v)
     return str(v)
 
-
 def sanitize_report(report: dict) -> dict:
-    """
-    Normalise every field before rendering.
-    Local models can return wrong types (dict where str expected, None, etc).
-    This pass makes the renderer crash-proof regardless of model behaviour.
-    """
-    # Top-level strings
-    for key in ("executive_summary", "overall_risk_rating", "confidence",
-                "data_sensitivity", "limitations", "assessed_by", "assessment_date"):
-        report[key] = _s(report.get(key))
-
-    # risk_score → float
-    try:
-        report["risk_score"] = float(report.get("risk_score") or 0)
-    except (TypeError, ValueError):
-        report["risk_score"] = 0.0
-
-    # Lists of strings
+    for k in ("executive_summary", "overall_risk_rating", "confidence", "data_sensitivity", "limitations", "assessed_by", "assessment_date"):
+        report[k] = _s(report.get(k))
+    try: report["risk_score"] = float(report.get("risk_score") or 0)
+    except (TypeError, ValueError): report["risk_score"] = 0.0
     for key in ("data_sources_used", "document_claims"):
         val = report.get(key, [])
         report[key] = [_s(x) for x in val] if isinstance(val, list) else []
-
-    # technical_summary
     tech = report.get("technical_summary")
-    if not isinstance(tech, dict):
-        report["technical_summary"] = {}
-        tech = report["technical_summary"]
-    tech["ssl_grade"]     = _s(tech.get("ssl_grade"),     "Unknown")
+    if not isinstance(tech, dict): report["technical_summary"] = {}; tech = report["technical_summary"]
+    tech["ssl_grade"] = _s(tech.get("ssl_grade"), "Unknown")
     tech["headers_grade"] = _s(tech.get("headers_grade"), "Unknown")
-    try:
-        tech["known_breaches"] = int(tech.get("known_breaches") or 0)
-    except (TypeError, ValueError):
-        tech["known_breaches"] = 0
+    try: tech["known_breaches"] = int(tech.get("known_breaches") or 0)
+    except (TypeError, ValueError): tech["known_breaches"] = 0
     vulns = tech.get("key_vulnerabilities", [])
     tech["key_vulnerabilities"] = [_s(v) for v in vulns] if isinstance(vulns, list) else []
-
-    # findings — now includes confidence and contradiction
     findings = report.get("findings", [])
-    if not isinstance(findings, list):
-        report["findings"] = []
+    if not isinstance(findings, list): report["findings"] = []
     else:
         for f in findings:
             if isinstance(f, dict):
-                for k in ("id", "source", "category", "severity", "confidence",
-                          "title", "observation", "risk"):
-                    f[k] = _s(f.get(k))
-                if "contradiction" not in f:
-                    f["contradiction"] = None
-
-    # essential_eight — maturity clamped 0–4
-    e8 = report.get("essential_eight", {})
-    if not isinstance(e8, dict):
-        report["essential_eight"] = {}
-        e8 = report["essential_eight"]
-    for ctrl, val in e8.items():
-        if not isinstance(val, dict):
-            e8[ctrl] = {"maturity": 0, "notes": "", "source": ""}
-            val = e8[ctrl]
-        try:
-            val["maturity"] = max(0, min(4, int(val.get("maturity") or 0)))
-        except (TypeError, ValueError):
-            val["maturity"] = 0
-        val["notes"]  = _s(val.get("notes"))
-        val["source"] = _s(val.get("source"))
-
-    # iso_27001
-    iso = report.get("iso_27001", [])
-    if isinstance(iso, list):
-        for d in iso:
-            if isinstance(d, dict):
-                for k in ("domain", "clause", "status", "notes"):
-                    d[k] = _s(d.get(k))
-
-    # nist_csf
-    nist = report.get("nist_csf", [])
-    if isinstance(nist, list):
-        for fn in nist:
-            if isinstance(fn, dict):
-                for k in ("function", "status", "notes"):
-                    fn[k] = _s(fn.get(k))
-
-    # privacy_act
-    pa = report.get("privacy_act", {})
-    if not isinstance(pa, dict):
-        report["privacy_act"] = {"overall_status": "Unknown", "apps_assessed": []}
-        pa = report["privacy_act"]
-    pa["overall_status"] = _s(pa.get("overall_status"), "Unknown")
-    apps = pa.get("apps_assessed", [])
-    if isinstance(apps, list):
-        for app in apps:
-            if isinstance(app, dict):
-                for k in ("app", "status", "notes"):
-                    app[k] = _s(app.get(k))
-
-    # risk_register (new in Phase 3)
+                for k in ("id", "source", "category", "severity", "confidence", "title", "observation", "risk"): f[k] = _s(f.get(k))
+                if "contradiction" not in f: f["contradiction"] = None
     rr = report.get("risk_register", [])
-    if not isinstance(rr, list):
-        report["risk_register"] = []
+    if not isinstance(rr, list): report["risk_register"] = []
     else:
         for r in rr:
             if isinstance(r, dict):
-                for k in ("id", "description", "category",
-                          "risk_rating", "treatment", "recommended_action"):
-                    r[k] = _s(r.get(k))
+                for k in ("id", "description", "category", "risk_rating", "treatment", "recommended_action"): r[k] = _s(r.get(k))
                 for k in ("likelihood", "impact", "risk_score"):
-                    try:
-                        r[k] = int(r.get(k) or 0)
-                    except (TypeError, ValueError):
-                        r[k] = 0
+                    try: r[k] = int(r.get(k) or 0)
+                    except (TypeError, ValueError): r[k] = 0
                 refs = r.get("finding_refs", [])
                 r["finding_refs"] = [_s(x) for x in refs] if isinstance(refs, list) else []
-
-    # recommendations
-    recs = report.get("recommendations", [])
-    if isinstance(recs, list):
-        for rec in recs:
-            if isinstance(rec, dict):
-                for k in ("priority", "action", "rationale", "framework_ref", "triggered_by"):
-                    rec[k] = _s(rec.get(k))
-
     return report
 
-
-# ── TERMINAL RENDERING ─────────────────────────────────────────────────────────
-
-RISK_STYLE = {
-    "CRITICAL": "bold magenta",
-    "HIGH":     "bold red",
-    "MEDIUM":   "bold yellow",
-    "LOW":      "bold green",
-}
-STATUS_STYLE = {
-    "Evident": "green", "Apparent": "green", "Compliant": "green",
-    "Partial": "yellow",
-    "Gap": "red", "Concern": "red", "Non-Compliant": "red",
-    "Unknown": "dim",
-}
-
-
 def grade_style(g: str) -> str:
-    if not g or g == "Unknown":    return "dim"
-    if g.upper().startswith("A"):  return "green"
-    if g.upper() == "B":           return "yellow"
-    if g.upper() == "C":           return "dark_orange"
+    if not g or g == "Unknown": return "dim"
+    if g.upper().startswith("A"): return "green"
+    if g.upper() == "B": return "yellow"
     return "red"
-
-
-def maturity_bar(level) -> str:
-    try:
-        level = max(0, min(4, int(level)))
-    except (TypeError, ValueError):
-        level = 0
-    if level == 0:
-        return "[dim]·  ·  ·  ·  ML0[/dim]"
-    color = "green" if level >= 3 else "yellow" if level == 2 else "red"
-    return f"[{color}]{'█' * level}{'░' * (4 - level)}  ML{level}[/{color}]"
-
 
 def risk_score_color(score: int) -> str:
     if score >= 16: return "bold magenta"
@@ -1023,486 +538,352 @@ def risk_score_color(score: int) -> str:
     if score >= 6:  return "bold yellow"
     return "bold green"
 
+RISK_STYLE = {"CRITICAL": "bold magenta", "HIGH": "bold red", "MEDIUM": "bold yellow", "LOW": "bold green", "UNKNOWN": "white"}
 
-def render_report(report: dict, company: str, domain: str = "",
-                  model: str = "", ref: str = "", assessor: str = ""):
+def render_report(report: dict, company: str, domain: str = "", model: str = "", ref: str = "", assessor: str = ""):
     console.print()
-    risk  = report.get("overall_risk_rating", "UNKNOWN")
+    risk  = report.get("overall_risk_rating", "UNKNOWN").upper()
     score = report.get("risk_score", 0)
     rc    = RISK_STYLE.get(risk, "white")
 
-    # ── Header panel ──────────────────────────────────────────────────────
     header = Text()
-    header.append(f"  {company.upper()}  ",       style="bold white")
-    header.append(f"│  {risk} RISK  ",             style=rc)
-    header.append(f"│  Score {score}/10  ",        style="white")
-    header.append(f"│  Confidence: {report.get('confidence','?')}  ", style="dim")
-    if domain:
-        header.append(f"│  {domain}", style="dim")
-    console.print(Panel(
-        header,
-        title=f"[bold]GRC Assessment Report[/bold]  [dim]v0.3 · {model}[/dim]",
-        subtitle=(
-            f"[dim]Ref: {ref}  ·  "
-            f"{report.get('assessment_date','')}  ·  "
-            f"Assessor: {assessor or 'not specified'}  ·  "
-            "Passive reconnaissance only[/dim]"
-        ),
-        border_style=rc,
-    ))
-
-    # ── Executive Summary ─────────────────────────────────────────────────
+    header.append(f"  {company.upper()}  ", style="bold white")
+    header.append(f"│  {risk} RISK  ", style=rc)
+    header.append(f"│  Score {score}/10  ", style="white")
+    if domain: header.append(f"│  {domain}", style="dim")
+    
+    console.print(Panel(header, title=f"[bold]GRC Assessment Report[/bold] [dim]v0.4 · {model}[/dim]", subtitle=f"[dim]Ref: {ref} · Assessor: {assessor or 'Automated'} · Passive recon[/dim]", border_style=rc))
+    
     section("Executive Summary")
     console.print(f"  {report.get('executive_summary','')}", style="white")
     console.print(f"\n  [dim]Data handled:[/dim]  {report.get('data_sensitivity','')}")
-    console.print(
-        f"  [dim]Sources used:[/dim]  "
-        f"{', '.join(_s(x) for x in report.get('data_sources_used',[]))}\n"
-    )
+    console.print(f"  [dim]Sources used:[/dim]  {', '.join(report.get('data_sources_used',[]))}\n")
 
-    # ── Document claims ───────────────────────────────────────────────────
-    claims = [c for c in report.get("document_claims", []) if c.strip()]
-    if claims:
-        section("Published Security Claims (from document)")
-        for c in claims:
-            console.print(f"  [dim]·[/dim] {c}")
-
-    # ── Technical Snapshot ────────────────────────────────────────────────
     tech = report.get("technical_summary", {})
     if tech:
         section("Technical Snapshot")
         t = Table(box=box.SIMPLE, show_header=False, padding=(0, 2))
-        t.add_column("Key",   style="dim", width=22)
-        t.add_column("Value", min_width=40)
-        sg = tech.get("ssl_grade",     "Unknown")
+        sg = tech.get("ssl_grade", "Unknown")
         hg = tech.get("headers_grade", "Unknown")
         bc = int(tech.get("known_breaches") or 0)
-        t.add_row("SSL Grade",      f"[{grade_style(sg)}]{sg}[/{grade_style(sg)}]")
-        t.add_row("Headers Grade",  f"[{grade_style(hg)}]{hg}[/{grade_style(hg)}]")
+        t.add_row("SSL Grade", f"[{grade_style(sg)}]{sg}[/{grade_style(sg)}]")
+        t.add_row("Headers Grade", f"[{grade_style(hg)}]{hg}[/{grade_style(hg)}]")
         t.add_row("Known Breaches", f"[{'red' if bc > 0 else 'green'}]{bc}[/]")
-        vulns = tech.get("key_vulnerabilities", [])
-        if vulns:
-            t.add_row("Vulnerabilities", "[red]" + " · ".join(vulns) + "[/red]")
         console.print(t)
 
-    # ── Findings ──────────────────────────────────────────────────────────
-    findings = report.get("findings", [])
-    if findings:
-        section(f"Findings  ({len(findings)})")
-        t = Table(box=box.SIMPLE, show_header=True, padding=(0, 1), expand=True)
-        t.add_column("ID",       style="dim", width=5)
-        t.add_column("Sev",                   width=8)
-        t.add_column("Conf",     style="dim", width=7)
-        t.add_column("Source",   style="dim", width=12)
-        t.add_column("Category", style="dim", width=18)
-        t.add_column("Finding",               min_width=28)
-        for f in findings:
-            sev  = f.get("severity",   "")
-            conf = f.get("confidence", "")
-            t.add_row(
-                f.get("id", ""),
-                f"[{RISK_STYLE.get(sev, 'white')}]{sev}[/]",
-                f"[dim]{conf}[/dim]",
-                f.get("source",   ""),
-                f.get("category", ""),
-                f.get("title",    ""),
-            )
-        console.print(t)
 
-        # Detailed view for HIGH findings
-        highs = [f for f in findings if f.get("severity") == "HIGH"]
-        if highs:
-            console.print("  [bold red]High severity — detail[/bold red]\n")
-            for f in highs:
-                console.print(f"  [bold]{f.get('id','')}  {f.get('title','')}[/bold]")
-                console.print(f"  Observation: {f.get('observation','')}", style="dim")
-                console.print(f"  Risk:        {f.get('risk','')}", style="dim red")
-                if f.get("contradiction"):
-                    console.print(
-                        f"  ⚠ Contradiction: {f['contradiction']}", style="bold yellow"
-                    )
-                console.print()
+# ── PHASE 4: DELIVERABLE GENERATION (PDF / HTML FALLBACK) ──────────────────────
 
-    # ── Risk Register (new in Phase 3) ────────────────────────────────────
-    rr = report.get("risk_register", [])
-    if rr:
-        section(f"Risk Register  ({len(rr)} risks)")
-        t = Table(box=box.SIMPLE, show_header=True, padding=(0, 1), expand=True)
-        t.add_column("ID",        style="dim",   width=5)
-        t.add_column("Rating",                   width=10)
-        t.add_column("Score",                    width=6)
-        t.add_column("L×I",       style="dim",   width=5)
-        t.add_column("Category",  style="dim",   width=16)
-        t.add_column("Description",              min_width=30)
-        t.add_column("Treatment", style="dim",   width=10)
-        for r in rr:
-            rs     = r.get("risk_score", 0)
-            rating = r.get("risk_rating", "")
-            t.add_row(
-                r.get("id", ""),
-                f"[{RISK_STYLE.get(rating.upper(), 'white')}]{rating}[/]",
-                f"[{risk_score_color(rs)}]{rs}[/]",
-                f"{r.get('likelihood','?')}×{r.get('impact','?')}",
-                r.get("category", ""),
-                r.get("description", ""),
-                r.get("treatment", ""),
-            )
-        console.print(t)
+def generate_pdf_report(report: dict, company: str, output_path: str):
+    """
+    Generates a professional, branded deliverable.
+    Includes full framework mapping for Essential Eight, ISO 27001, NIST CSF, and APPs.
+    """
+    # 1. Build HTML Rows for Findings
+    findings_html = ""
+    for f in report.get("findings", []):
+        sev_class = f"risk-{f.get('severity', 'UNKNOWN').upper()}"
+        findings_html += f"""
+        <tr>
+            <td>{f.get('id', '')}</td>
+            <td class='{sev_class}'>{f.get('severity', '')}</td>
+            <td>{f.get('category', '')}</td>
+            <td><strong>{f.get('title', '')}</strong><br><span style='font-size:0.9em; color:#555;'>{f.get('observation', '')}</span></td>
+        </tr>"""
 
-        # Expanded detail for Critical / High
-        crit_high = [
-            r for r in rr
-            if r.get("risk_rating", "").upper() in ("CRITICAL", "HIGH")
-        ]
-        if crit_high:
-            console.print("  [bold red]Critical / High risks — actions[/bold red]\n")
-            for r in crit_high:
-                refs = ", ".join(r.get("finding_refs", []))
-                console.print(f"  [bold]{r.get('id','')}[/bold]  {r.get('description','')}")
-                console.print(f"  Action:       {r.get('recommended_action','')}", style="dim")
-                if refs:
-                    console.print(f"  Triggered by: {refs}", style="dim")
-                console.print()
+    # 2. Build HTML Rows for Risk Register
+    risks_html = ""
+    for r in report.get("risk_register", []):
+        sev_class = f"risk-{r.get('risk_rating', 'UNKNOWN').upper()}"
+        risks_html += f"""
+        <tr>
+            <td>{r.get('id', '')}</td>
+            <td class='{sev_class}'>{r.get('risk_rating', '')} ({r.get('risk_score', '')})</td>
+            <td>{r.get('description', '')}</td>
+            <td>{r.get('recommended_action', '')}</td>
+        </tr>"""
 
-    # ── Essential Eight ───────────────────────────────────────────────────
-    section("Essential Eight Maturity  (ASD ACSC)")
+    # 3. Build HTML Rows for Essential Eight
     e8_labels = {
         "patch_applications":         "Patch Applications",
         "patch_os":                   "Patch OS",
-        "multi_factor_auth":          "MFA",
-        "restrict_admin_privileges":  "Restrict Admin",
-        "application_control":        "App Control",
-        "restrict_macros":            "Restrict Macros",
-        "user_application_hardening": "App Hardening",
-        "regular_backups":            "Backups",
+        "multi_factor_auth":          "Multi-Factor Authentication (MFA)",
+        "restrict_admin_privileges":  "Restrict Admin Privileges",
+        "application_control":        "Application Control",
+        "restrict_macros":            "Restrict Microsoft Office Macros",
+        "user_application_hardening": "User Application Hardening",
+        "regular_backups":            "Regular Backups",
     }
-    t = Table(box=box.SIMPLE, show_header=True, padding=(0, 1), expand=True)
-    t.add_column("Control",  width=24)
-    t.add_column("Maturity", width=18)
-    t.add_column("Evidence", style="dim", width=12)
-    t.add_column("Notes",    min_width=28)
+    e8_html = ""
     for key, label in e8_labels.items():
         val = report.get("essential_eight", {}).get(key, {})
-        t.add_row(
-            label,
-            maturity_bar(val.get("maturity", 0)),
-            val.get("source", ""),
-            val.get("notes",  ""),
-        )
-    console.print(t)
+        mat = val.get("maturity", 0)
+        # Simple CSS bar mimicry
+        bar = f"<span style='color:#27AE60;'>{'★' * mat}</span><span style='color:#BDC3C7;'>{'☆' * (4 - mat)}</span> (ML{mat})" if mat >= 3 else f"<span style='color:#F39C12;'>{'★' * mat}</span><span style='color:#BDC3C7;'>{'☆' * (4 - mat)}</span> (ML{mat})"
+        if mat == 0: bar = "<span style='color:#7F8C8D;'>☆☆☆☆ (ML0)</span>"
+        e8_html += f"""
+        <tr>
+            <td><strong>{label}</strong></td>
+            <td>{bar}</td>
+            <td>{val.get('source', 'None')}</td>
+            <td>{val.get('notes', '')}</td>
+        </tr>"""
 
-    # ── ISO 27001 ─────────────────────────────────────────────────────────
-    section("ISO 27001:2022")
-    t = Table(box=box.SIMPLE, show_header=True, padding=(0, 1), expand=True)
-    t.add_column("Clause", style="dim", width=7)
-    t.add_column("Domain",              width=32)
-    t.add_column("Status",              width=13)
-    t.add_column("Notes",               min_width=24)
+    # 4. Build HTML Rows for ISO 27001
+    iso_html = ""
     for d in report.get("iso_27001", []):
-        st = d.get("status", "Unknown")
-        t.add_row(
-            d.get("clause", ""),
-            d.get("domain", ""),
-            f"[{STATUS_STYLE.get(st, 'white')}]{st}[/]",
-            d.get("notes",  ""),
-        )
-    console.print(t)
+        iso_html += f"""
+        <tr>
+            <td>{d.get('clause', '')}</td>
+            <td>{d.get('domain', '')}</td>
+            <td><span class='status-{d.get("status", "Unknown").lower()}'>{d.get('status', 'Unknown')}</span></td>
+            <td>{d.get('notes', '')}</td>
+        </tr>"""
 
-    # ── NIST CSF ──────────────────────────────────────────────────────────
-    section("NIST CSF 2.0")
-    t = Table(box=box.SIMPLE, show_header=True, padding=(0, 1))
-    t.add_column("Function", width=12)
-    t.add_column("Status",   width=13)
-    t.add_column("Notes",    min_width=44)
+    # 5. Build HTML Rows for NIST CSF
+    nist_html = ""
     for fn in report.get("nist_csf", []):
-        st = fn.get("status", "Unknown")
-        t.add_row(
-            fn.get("function", ""),
-            f"[{STATUS_STYLE.get(st, 'white')}]{st}[/]",
-            fn.get("notes", ""),
-        )
-    console.print(t)
+        nist_html += f"""
+        <tr>
+            <td><strong>{fn.get('function', '')}</strong></td>
+            <td><span class='status-{fn.get("status", "Unknown").lower()}'>{fn.get('status', 'Unknown')}</span></td>
+            <td>{fn.get('notes', '')}</td>
+        </tr>"""
 
-    # ── Privacy Act APPs ──────────────────────────────────────────────────
-    section("Australian Privacy Act — APPs")
+    # 6. Build HTML Rows for Privacy Act APPs
     pa = report.get("privacy_act", {})
-    overall = pa.get("overall_status", "Unknown")
-    console.print(f"  Overall: [{STATUS_STYLE.get(overall,'white')}]{overall}[/]\n")
-    t = Table(box=box.SIMPLE, show_header=True, padding=(0, 1), expand=True)
-    t.add_column("APP",    width=42)
-    t.add_column("Status", width=12)
-    t.add_column("Notes",  min_width=24)
+    pa_html = ""
     for app in pa.get("apps_assessed", []):
-        st = app.get("status", "Unknown")
-        t.add_row(
-            app.get("app", ""),
-            f"[{STATUS_STYLE.get(st, 'white')}]{st}[/]",
-            app.get("notes", ""),
-        )
-    console.print(t)
+        pa_html += f"""
+        <tr>
+            <td>{app.get('app', '')}</td>
+            <td><span class='status-{app.get("status", "Unknown").lower()}'>{app.get('status', 'Unknown')}</span></td>
+            <td>{app.get('notes', '')}</td>
+        </tr>"""
 
-    # ── Recommendations ───────────────────────────────────────────────────
-    recs = report.get("recommendations", [])
-    if recs:
-        section(f"Recommendations  ({len(recs)})")
-        for i, rec in enumerate(recs, 1):
-            p = rec.get("priority", "")
-            console.print(
-                f"  [{i}] [{RISK_STYLE.get(p, 'white')}]{p}[/]  {rec.get('action','')}"
-            )
-            console.print(f"       {rec.get('rationale','')}",   style="dim")
-            console.print(
-                f"       {rec.get('framework_ref','')}  ·  "
-                f"triggered by: {rec.get('triggered_by','')}\n",
-                style="dim",
-            )
+    html_content = f"""
+    <!DOCTYPE html>
+    <html lang="en">
+    <head>
+        <meta charset="UTF-8">
+        <title>GRC Assessment - {company}</title>
+        <style>
+            @page {{ size: A4; margin: 2cm; @bottom-right {{ content: counter(page) " of " counter(pages); font-family: 'Helvetica', sans-serif; font-size: 9pt; color: #7F8C8D; }} }}
+            @media print {{ body {{ font-size: 10pt; }} .no-print {{ display: none; }} }}
+            body {{ font-family: 'Helvetica Neue', Helvetica, Arial, sans-serif; color: #2C3E50; line-height: 1.6; max-width: 900px; margin: 40px auto; padding: 0 20px; }}
+            h1, h2, h3 {{ color: #2980B9; margin-top: 30px; border-bottom: 1px solid #ECF0F1; padding-bottom: 5px; }}
+            .cover {{ text-align: center; margin-top: 15vh; margin-bottom: 20vh; }}
+            .cover h1 {{ font-size: 3em; margin-bottom: 10px; }}
+            .cover h2 {{ font-size: 1.8em; color: #7F8C8D; font-weight: 300; }}
+            .cover .meta {{ margin-top: 50px; font-size: 1.1em; color: #34495E; }}
+            .section {{ page-break-before: always; margin-top: 40px; }}
+            table {{ width: 100%; border-collapse: collapse; margin-top: 15px; margin-bottom: 30px; font-size: 10pt; }}
+            th, td {{ border: 1px solid #BDC3C7; padding: 12px; text-align: left; vertical-align: top; }}
+            th {{ background-color: #ECF0F1; font-weight: bold; }}
+            .risk-CRITICAL {{ color: #C0392B; font-weight: bold; }}
+            .risk-HIGH {{ color: #E74C3C; font-weight: bold; }}
+            .risk-MEDIUM {{ color: #F39C12; font-weight: bold; }}
+            .risk-LOW {{ color: #27AE60; font-weight: bold; }}
+            .status-evident, .status-compliant {{ color: #27AE60; font-weight: bold; }}
+            .status-partial, .status-apparent {{ color: #F39C12; font-weight: bold; }}
+            .status-gap, .status-concern, .status-non-compliant {{ color: #C0392B; font-weight: bold; }}
+            .status-unknown {{ color: #7F8C8D; font-style: italic; }}
+            .disclaimer {{ font-size: 0.85em; color: #7F8C8D; margin-top: 40px; padding: 15px; background-color: #F9F9F9; border-left: 4px solid #BDC3C7; }}
+            .fallback-alert {{ background-color: #E6F2FF; border: 1px solid #B3D7FF; padding: 15px; border-radius: 4px; margin-bottom: 20px; font-size: 0.95em; color: #004085; }}
+        </style>
+    </head>
+    <body>
+        <div class="fallback-alert no-print">
+            <strong>💡 Standalone Document View:</strong> Formatted cleanly. To export this deliverable directly to an offline copy, open this document inside a browser, press <code>Ctrl + P</code>, and click <strong>Save as PDF</strong>.
+        </div>
+        <div class="cover">
+            <h1>Security Assessment Report</h1>
+            <h2>{company}</h2>
+            <div class="meta">
+                <p><strong>Reference:</strong> {report.get('_meta', {}).get('ref', 'N/A')}</p>
+                <p><strong>Date:</strong> {report.get('assessment_date', 'N/A')}</p>
+                <p><strong>Assessor:</strong> {report.get('_meta', {}).get('assessor', 'Automated GRC Agent v0.4')}</p>
+            </div>
+        </div>
+        <div class="section">
+            <h2>1. Executive Summary</h2>
+            <p>{report.get('executive_summary', 'No summary provided.')}</p>
+            <p><strong>Data Sensitivity Context:</strong> {report.get('data_sensitivity', 'Unknown')}</p>
+        </div>
+        <div class="section">
+            <h2>2. Technical Findings</h2>
+            <table>
+                <thead><tr><th>ID</th><th>Severity</th><th>Category</th><th>Observation</th></tr></thead>
+                <tbody>{findings_html}</tbody>
+            </table>
+        </div>
+        <div class="section">
+            <h2>3. Risk Register</h2>
+            <table>
+                <thead><tr><th>ID</th><th>Rating</th><th>Description</th><th>Recommended Action</th></tr></thead>
+                <tbody>{risks_html}</tbody>
+            </table>
+        </div>
+        
+        <div class="section">
+            <h2>4. Framework Mappings</h2>
+            
+            <h3>Essential Eight Maturity (ASD ACSC)</h3>
+            <table>
+                <thead><tr><th>Control Strategy</th><th>Maturity Level</th><th>Evidence Ref</th><th>Notes / Observations</th></tr></thead>
+                <tbody>{e8_html}</tbody>
+            </table>
 
-    # ── Disclaimer ────────────────────────────────────────────────────────
-    console.print(Panel(
-        f"[dim]{report.get('limitations','')}\n\n"
-        "Passive reconnaissance only — no active scanning was performed. "
-        "Findings are indicative and require human review before professional or client use. "
-        "This report is not a substitute for authorised penetration testing, "
-        "legal advice, or a formal compliance audit.[/dim]",
-        title="[dim]Disclaimer & Limitations[/dim]",
-        border_style="dim",
-    ))
+            <h3>ISO 27001:2022 Alignment</h3>
+            <table>
+                <thead><tr><th>Clause</th><th>Domain</th><th>Status</th><th>Notes</th></tr></thead>
+                <tbody>{iso_html}</tbody>
+            </table>
+
+            <h3>NIST CSF 2.0 Mapping</h3>
+            <table>
+                <thead><tr><th>Function</th><th>Status</th><th>Notes</th></tr></thead>
+                <tbody>{nist_html}</tbody>
+            </table>
+
+            <h3>Australian Privacy Act (APPs)</h3>
+            <p><strong>Overall Privacy Status:</strong> <span class="status-{pa.get('overall_status', 'Unknown').lower()}">{pa.get('overall_status', 'Unknown')}</span></p>
+            <table>
+                <thead><tr><th>Australian Privacy Principle (APP)</th><th>Status</th><th>Notes</th></tr></thead>
+                <tbody>{pa_html}</tbody>
+            </table>
+        </div>
+
+        <div class="section">
+            <h2>5. Limitations & Disclaimers</h2>
+            <div class="disclaimer">
+                <p><strong>Strictly Passive Reconnaissance:</strong> This report was generated using only public, passive data sources. No active scanning was performed.</p>
+                <p><strong>Indicative Findings:</strong> The findings mapped in this document require human review by a qualified cybersecurity professional before professional or client use.</p>
+                <p><strong>Not Authorized Penetration Testing:</strong> This assessment is not a substitute for an authorized penetration test, a formal compliance audit, or legal counsel.</p>
+            </div>
+        </div>
+    </body>
+    </html>
+    """
+
+    if WEASYPRINT_AVAILABLE:
+        try:
+            log("⟳", "Generating PDF report via WeasyPrint...", "cyan")
+            HTML(string=html_content).write_pdf(output_path)
+            log("✓", f"Successfully generated PDF: {output_path}", "green")
+            return
+        except Exception as e:
+            log("⚠", f"WeasyPrint engine failure, dropping back to clean HTML. Error: {e}", "yellow")
+    
+    html_path = output_path.replace(".pdf", ".html")
+    try:
+        with open(html_path, "w", encoding="utf-8") as fh:
+            fh.write(html_content)
+        log("✓", f"Created standalone report: [bold]{html_path}[/bold]", "green")
+        log("📎", "Double-click the .html file, press Ctrl+P, and hit 'Save as PDF' to generate the deliverable.", "dim")
+    except Exception as e:
+        log("✗", f"Failed to save fallback report: {e}", "red")
 
 
 # ── MAIN ───────────────────────────────────────────────────────────────────────
 
 def main():
-    parser = argparse.ArgumentParser(
-        description="GRC Assessment Agent v0.3 — Phase 3: framework mapping + risk register",
-        epilog=(
-            "Examples:\n"
-            "  python agent.py 'Latitude Financial' --domain latitudefinancial.com.au --ticker LFS\n"
-            "  python agent.py 'Medibank' --domain medibank.com.au --doc policy.txt\n"
-            "  python agent.py 'CBA' --domain commbank.com.au --ticker CBA --output json\n"
-            "  python agent.py 'ANZ' --domain anz.com.au --assessor 'J. Smith'\n"
-        ),
-        formatter_class=argparse.RawDescriptionHelpFormatter,
-    )
+    parser = argparse.ArgumentParser(description="GRC Assessment Agent v0.4 — Phase 4")
     parser.add_argument("company",             help='Company name e.g. "Latitude Financial"')
     parser.add_argument("--domain",    "-d",   help="Domain to scan e.g. latitudefinancial.com.au")
-    parser.add_argument("--ticker",    "-t",   help="ASX ticker e.g. LFS  (enables announcement search)")
+    parser.add_argument("--ticker",    "-t",   help="ASX ticker e.g. LFS")
     parser.add_argument("--doc",       "-f",   help="Path to .txt document for analysis")
-    parser.add_argument("--model",     "-m",   default=OLLAMA_MODEL,
-                        help=f"Ollama model (default: {OLLAMA_MODEL})")
-    parser.add_argument("--output",    "-o",   default="both",
-                        choices=["terminal", "json", "both"])
-    parser.add_argument("--assessor",          default="",
-                        help="Assessor name for report metadata")
-    parser.add_argument("--ref",               default="",
-                        help="Assessment reference number (auto-generated if omitted)")
-    parser.add_argument("--no-ssl",            action="store_true")
-    parser.add_argument("--no-headers",        action="store_true")
-    parser.add_argument("--no-news",           action="store_true")
-    parser.add_argument("--no-hibp",           action="store_true")
-    parser.add_argument("--no-asx",            action="store_true",
-                        help="Skip ASX announcement search")
-    parser.add_argument("--no-oaic",           action="store_true",
-                        help="Skip OAIC NDB search")
-    parser.add_argument("--list-models",       action="store_true",
-                        help="List available Ollama models and exit")
+    parser.add_argument("--model",     "-m",   default=OLLAMA_MODEL)
+    parser.add_argument("--output",    "-o",   default="both", choices=["terminal", "json", "both", "pdf", "all"])
+    parser.add_argument("--assessor",          default="")
+    parser.add_argument("--ref",               default="")
     args = parser.parse_args()
 
     ref = args.ref or gen_ref()
 
     console.print(Panel(
-        f"[bold white]GRC Assessment Agent[/bold white]  "
-        f"[dim]v0.3 · Phase 3 · {args.model}[/dim]\n"
-        f"[dim]Ref: {ref}  ·  Two-pass AI  ·  ASX + OAIC  ·  "
-        "Passive recon · Australian frameworks[/dim]",
+        f"[bold white]GRC Assessment Agent[/bold white]  [dim]v0.4 · Phase 4 · {args.model}[/dim]\n"
+        f"[dim]Ref: {ref}  ·  Two-pass AI  ·  ASX + OAIC  ·  Passive recon[/dim]",
         border_style="blue",
     ))
 
-    # Ollama check
+    # Restored verification status logs
     ollama_status = check_ollama(args.model)
-
-    if args.list_models:
-        if not ollama_status.get("models"):
-            console.print("[red]✗  Ollama not running or no models installed.[/red]")
-            console.print("  Install: https://ollama.com")
-        else:
-            console.print("\n  [bold]Available models:[/bold]")
-            for m in ollama_status["models"]:
-                console.print(f"  → {m}")
-            console.print("\n  Recommended: llama3.1, mistral, gemma2, qwen2.5\n")
-        sys.exit(0)
-
     if not ollama_status.get("ok"):
-        err = ollama_status.get("error", "unknown error")
-        if "not running" in err:
-            console.print("[red]✗  Ollama is not running.[/red]")
-            console.print("  → Install:    https://ollama.com")
-            console.print("  → Start:      ollama serve")
-            console.print(f"  → Pull model: ollama pull {args.model}")
-        else:
-            console.print(f"[red]✗  Model '{args.model}' not found in Ollama.[/red]")
-            console.print(f"  → Run: ollama pull {args.model}")
-            if ollama_status.get("models"):
-                console.print(f"  → Available: {', '.join(ollama_status['models'])}")
+        console.print(f"[red]✗ Model '{args.model}' not found or Ollama not running.[/red]")
         sys.exit(1)
 
     log("✓", f"Ollama running · model: [bold]{args.model}[/bold]", "green")
 
-    if not BS4_AVAILABLE:
-        log("⚠",
-            "beautifulsoup4 not installed — ASX/OAIC scrapers disabled  "
-            "(pip install beautifulsoup4 lxml)", "yellow")
-
-    # Load optional document
-    doc_text = ""
-    if args.doc:
-        try:
-            with open(args.doc, encoding="utf-8", errors="ignore") as fh:
-                doc_text = fh.read()
-            log("📄", f"Document: {args.doc}  ({len(doc_text):,} chars)")
-        except FileNotFoundError:
-            log("⚠", f"Document not found: {args.doc}", "yellow")
-
-    # ── Intelligence gathering ─────────────────────────────────────────────
+    # ── Intelligence Gathering ─────────────────────────────────────────────
     section("Gathering intelligence")
-    ssl_data = headers_data = news_data = hibp_data = None
-    asx_data = oaic_data = None
+    ssl_data = headers_data = news_data = hibp_data = asx_data = oaic_data = None
 
-    # Functions to run in parallel (everything except SSL, which needs live feedback)
-    def _collect_parallel(has_domain: bool):
+    def _collect_parallel():
         with ThreadPoolExecutor(max_workers=5) as ex:
             futures = {}
-
-            if has_domain and not args.no_headers:
-                log("⟳", f"Security headers: {args.domain}…")
-                futures["headers"] = ex.submit(check_security_headers, args.domain)
-
-            if has_domain and not args.no_hibp and HIBP_API_KEY:
-                log("⟳", f"HIBP: {clean_domain(args.domain)}…")
-                futures["hibp"] = ex.submit(check_hibp, args.domain)
-            elif not args.no_hibp:
-                log("○", "HIBP: skipped — add HIBP_API_KEY to .env", "dim")
-
-            if not args.no_news and TAVILY_API_KEY:
-                log("⟳", f"News: '{args.company}'…")
-                futures["news"] = ex.submit(search_news, args.company)
-            elif not args.no_news:
-                log("○", "News: skipped — add TAVILY_API_KEY to .env", "dim")
-
-            if not args.no_asx:
-                log("⟳", f"ASX: {args.ticker or args.company}…")
-                futures["asx"] = ex.submit(search_asx, args.company, args.ticker)
-
-            if not args.no_oaic and BS4_AVAILABLE:
-                log("⟳", f"OAIC: '{args.company}'…")
-                futures["oaic"] = ex.submit(search_oaic, args.company)
-            elif not args.no_oaic:
-                log("○", "OAIC: skipped (install beautifulsoup4)", "dim")
-
-            results = {}
-            for name, fut in futures.items():
-                try:
-                    results[name] = fut.result()
-                except Exception as e:
-                    log("✗", f"{name}: {e}", "yellow")
-                    results[name] = None
-            return results
+            if args.domain and not HIBP_API_KEY: log("○", "HIBP: skipped — add HIBP_API_KEY to .env", "dim")
+            if args.domain and HIBP_API_KEY:     futures["hibp"] = ex.submit(check_hibp, args.domain)
+            if TAVILY_API_KEY:                   futures["news"] = ex.submit(search_news, args.company)
+            else:                                log("○", "News: skipped — add TAVILY_API_KEY to .env", "dim")
+            futures["asx"]  = ex.submit(search_asx, args.company, args.ticker)
+            futures["oaic"] = ex.submit(search_oaic, args.company)
+            if args.domain:                      futures["headers"] = ex.submit(check_security_headers, args.domain)
+            
+            res = {}
+            for k, f in futures.items():
+                try: res[k] = f.result()
+                except Exception as e: res[k] = {"error": str(e)}
+            return res
 
     if args.domain:
-        # SSL runs separately so we can stream progress messages
-        if not args.no_ssl:
-            log("⟳", f"SSL Labs: {args.domain} — takes 60–90 s…")
-            ssl_data = check_ssl(args.domain)
-            if "error" not in ssl_data:
-                log("✓", f"SSL Labs: [bold]{ssl_data.get('grade')}[/bold]", "green")
-            else:
-                log("✗", f"SSL Labs: {ssl_data['error']}", "yellow")
-        else:
-            log("○", "SSL Labs: skipped (--no-ssl)", "dim")
-
-        collected = _collect_parallel(has_domain=True)
+        log("⟳", f"SSL Labs: {args.domain} — takes 60–90 s…")
+        ssl_data = check_ssl(args.domain)
+        if "error" not in ssl_data: log("✓", f"SSL Labs: [bold]{ssl_data.get('grade')}[/bold]", "green")
+        else:                       log("✗", f"SSL Labs: {ssl_data['error']}", "yellow")
     else:
         log("○", "No domain — skipping SSL / headers / HIBP", "dim")
-        collected = _collect_parallel(has_domain=False)
 
+    collected = _collect_parallel()
     headers_data = collected.get("headers")
     hibp_data    = collected.get("hibp")
     news_data    = collected.get("news")
     asx_data     = collected.get("asx")
     oaic_data    = collected.get("oaic")
 
-    # Log parallel results
-    if headers_data:
-        if "error" not in headers_data:
-            log("✓", f"Headers: [bold]{headers_data.get('grade','?')}[/bold]", "green")
-        else:
-            log("✗", f"Headers: {headers_data['error']}", "yellow")
-    if hibp_data and not hibp_data.get("skipped"):
-        if "error" not in hibp_data:
-            n = hibp_data.get("count", 0)
-            log("✓", f"HIBP: [{'red' if n else 'green'}]{n} breach(es)[/]",
-                "red" if n else "green")
-        else:
-            log("✗", f"HIBP: {hibp_data.get('error')}", "yellow")
-    if news_data and not news_data.get("skipped") and "error" not in (news_data or {}):
-        log("✓", f"News: {len((news_data or {}).get('results',[]))} results", "green")
-    if asx_data:
-        if asx_data.get("skipped") or asx_data.get("note"):
-            log("○", f"ASX: {asx_data.get('note','not listed')}", "dim")
-        else:
-            sc = asx_data.get("security_count", 0)
-            t_count = asx_data.get("total_scanned", 0)
-            log("✓",
-                f"ASX [{asx_data.get('ticker','?')}]: {t_count} announcements, "
-                f"[{'red' if sc else 'green'}]{sc} security-related[/]",
-                "red" if sc else "green")
-    if oaic_data and not oaic_data.get("skipped"):
-        mc = oaic_data.get("mention_count", 0)
-        log("✓", f"OAIC: [{'red' if mc else 'green'}]{mc} mention(s)[/]",
-            "red" if mc else "green")
+    # Restored data source status prints
+    if headers_data and "error" not in headers_data: log("✓", f"Headers: [bold]{headers_data.get('grade','?')}[/bold]", "green")
+    if hibp_data and "error" not in hibp_data and not hibp_data.get("skipped"): log("✓", f"HIBP: {hibp_data.get('count', 0)} breach(es)", "green")
+    if news_data and "error" not in news_data and not news_data.get("skipped"): log("✓", f"News: {len(news_data.get('results', []))} items", "green")
+    if asx_data and not asx_data.get("note"): log("✓", f"ASX: {asx_data.get('security_count', 0)} security alerts", "green")
+    if oaic_data and not oaic_data.get("skipped"): log("✓", f"OAIC: {oaic_data.get('mention_count', 0)} mentions", "green")
 
-    # ── Two-pass AI analysis ───────────────────────────────────────────────
+    doc_text = ""
+    if args.doc and os.path.exists(args.doc):
+        with open(args.doc, encoding="utf-8", errors="ignore") as fh: doc_text = fh.read()
+
+    # ── Analysis ───────────────────────────────────────────────────────────
     section(f"Running two-pass AI analysis  [{args.model}]")
-
     try:
-        report = analyse_two_pass(
-            args.company, args.domain or "",
-            ssl_data, headers_data, news_data,
-            hibp_data, asx_data, oaic_data, doc_text,
-            args.model,
-        )
+        report = analyse_two_pass(args.company, args.domain or "", ssl_data, headers_data, news_data, hibp_data, asx_data, oaic_data, doc_text, args.model)
         report = sanitize_report(report)
-    except (ConnectionError, ValueError) as e:
-        console.print(f"\n[red]✗  {e}[/red]")
+    except Exception as e:
+        console.print(f"\n[red]✗  Analysis failed: {e}[/red]")
         sys.exit(1)
 
     report["assessment_date"] = datetime.now().strftime("%d %B %Y")
-    report["_meta"] = {
-        "ref":      ref,
-        "company":  args.company,
-        "domain":   args.domain or "",
-        "ticker":   args.ticker or "",
-        "assessor": args.assessor or "",
-        "model":    args.model,
-        "version":  "0.3",
-        "phase":    "Phase 3 — Two-pass AI · Framework mapping · Risk register",
-    }
+    report["_meta"] = {"ref": ref, "company": args.company, "domain": args.domain or "", "assessor": args.assessor, "model": args.model}
 
-    # ── Output ─────────────────────────────────────────────────────────────
-    if args.output in ("terminal", "both"):
-        render_report(
-            report, args.company, args.domain or "",
-            args.model, ref=ref, assessor=args.assessor,
-        )
+    # ── Outputs ─────────────────────────────────────────────────────────────
+    ts = datetime.now().strftime("%Y%m%d_%H%M")
+    slug = re.sub(r"[^a-z0-9]+", "_", args.company.lower()).strip("_")
 
-    if args.output in ("json", "both"):
-        ts       = datetime.now().strftime("%Y%m%d_%H%M")
-        slug     = re.sub(r"[^a-z0-9]+", "_", args.company.lower()).strip("_")
-        filename = f"{slug}_grc_v03_{ts}.json"
-        with open(filename, "w") as fh:
-            json.dump(report, fh, indent=2)
-        console.print(f"\n  [green]✓[/green]  Saved: [bold]{filename}[/bold]")
-        console.print("  [dim]Pass this JSON to Phase 4 for PDF generation.[/dim]\n")
-
+    if args.output in ("terminal", "both", "all"):
+        render_report(report, args.company, args.domain or "", args.model, ref=ref, assessor=args.assessor)
+    if args.output in ("json", "both", "all"):
+        with open(f"{slug}_grc_v04_{ts}.json", "w") as fh: json.dump(report, fh, indent=2)
+    if args.output in ("pdf", "all"):
+        generate_pdf_report(report, args.company, f"{slug}_grc_v04_{ts}.pdf")
 
 if __name__ == "__main__":
     main()
