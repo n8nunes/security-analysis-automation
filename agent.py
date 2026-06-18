@@ -45,7 +45,7 @@ except ImportError:
 try:
     from weasyprint import HTML
     WEASYPRINT_AVAILABLE = True
-except ImportError:
+except Exception:  # Catches the OSError thrown by missing C binaries on Windows
     WEASYPRINT_AVAILABLE = False
 
 load_dotenv()
@@ -373,8 +373,17 @@ Respond with this exact JSON schema:
 
 PASS2_SYSTEM = """\
 You are a senior GRC analyst mapping structured cybersecurity findings to Australian and international frameworks.
-ESSENTIAL EIGHT MATURITY LEVELS (ASD ACSC — 0 to 4). Default to 0 for any control that passive recon cannot observe.
+
+INFERENCE AND CROSS-MAPPING RULES:
+Real-world policy documents often use generic terms. You must act as a translator:
+- Infer framework compliance from synonyms (e.g., "two-step verification" = MFA; "antivirus/endpoint protection" = Application Control; "system updates" = Patching).
+- Cross-map single claims to multiple frameworks (e.g., A claim that "data is encrypted" should simultaneously satisfy NIST 'PROTECT', ISO 27001 Clause 8, and Privacy Act APP 11).
+
+ESSENTIAL EIGHT MATURITY LEVELS (ASD ACSC — 0 to 4): 
+Default to 0 for any control that passive recon cannot observe. HOWEVER, if 'document_claims' provides implicit or explicit internal policy evidence, use it to infer and map the appropriate maturity level instead of defaulting to Unknown.
+
 RISK SCORE = likelihood (1–5) × impact (1–5)
+
 RULES: Output ONLY valid JSON. No preamble.
 Respond with this exact JSON schema:
 {
@@ -444,7 +453,12 @@ def build_pass1_message(company, domain, ssl_data, headers_data, news_data, hibp
 
 def build_pass2_message(pass1: dict) -> str:
     findings_compact = [f"{f.get('id','?')} [{f.get('severity','?')}] {f.get('title','')} | {f.get('observation','')}" for f in pass1.get("findings", [])]
-    return json.dumps({"data_sensitivity": pass1.get("data_sensitivity", ""), "executive_brief": pass1.get("executive_brief", ""), "findings": findings_compact}, separators=(",", ":"))
+    return json.dumps({
+        "data_sensitivity": pass1.get("data_sensitivity", ""), 
+        "executive_brief": pass1.get("executive_brief", ""), 
+        "findings": findings_compact,
+        "document_claims": pass1.get("document_claims", [])  # <-- THIS LINE PASSES THE DOC TO PASS 2
+    }, separators=(",", ":"))
 
 def analyse_two_pass(company, domain, ssl_data, headers_data, news_data, hibp_data, asx_data, oaic_data, doc_text, model) -> dict:
     log("⟳", "Pass 1 — extracting technical findings…", "cyan")
