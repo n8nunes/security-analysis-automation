@@ -2,8 +2,6 @@
 
 An automated Governance, Risk, and Compliance (GRC) assessment agent that performs passive reconnaissance and maps findings to security frameworks. This tool automatically aggregates intelligence from public data sources to generate client-ready, professional security assessment reports.
 
-A hiring manager or a security team looking at this project will see a practical demonstration of software engineering fundamentals, structured risk thinking, and real-world framework mapping.
-
 ---
 
 ## Technical Architecture
