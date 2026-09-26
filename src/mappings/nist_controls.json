@@ -1,0 +1,299 @@
+[
+  {
+    "control_id": "GV.RO-01",
+    "control_name": "Roles and Responsibilities",
+    "function": "Govern",
+    "description": "Organizational cybersecurity roles, responsibilities, and authorities are established and communicated.",
+    "observable_signals": [
+      "Mentions of a CISO or dedicated security team in public documents",
+      "Trust center outlines security governance structure",
+      "About page lists security leadership"
+    ],
+    "confidence_level": "HIGH",
+    "data_sources": ["website", "trust_center"],
+    "evidence_format": "trust_center_quotes + links",
+    "keyword_matching_terms": ["CISO", "Chief Information Security Officer", "security team", "security governance", "security committee", "roles and responsibilities"],
+    "llm_extraction_prompt": "Does this document mention a security officer, CISO, or dedicated security team responsible for oversight? Answer YES/NO + provide exact quote."
+  },
+  {
+    "control_id": "GV.PO-01",
+    "control_name": "Cybersecurity Policy",
+    "function": "Govern",
+    "description": "An organizational cybersecurity policy is established, communicated, and enforced.",
+    "observable_signals": [
+      "Public information security policy document available",
+      "Trust center mentions formalized security policies"
+    ],
+    "confidence_level": "HIGH",
+    "data_sources": ["website", "trust_center"],
+    "evidence_format": "trust_center_quotes + links",
+    "keyword_matching_terms": ["information security policy", "cybersecurity policy", "security policies", "acceptable use policy"],
+    "llm_extraction_prompt": "Does this document mention that the organization has an established information security policy or cybersecurity policy? Answer YES/NO + provide exact quote."
+  },
+  {
+    "control_id": "GV.RM-01",
+    "control_name": "Risk Management Strategy",
+    "function": "Govern",
+    "description": "A risk management strategy is established and managed.",
+    "observable_signals": [
+      "Trust center mentions risk assessments or risk management framework",
+      "Compliance with frameworks that require risk management (e.g., ISO 27001)"
+    ],
+    "confidence_level": "HIGH",
+    "data_sources": ["website", "trust_center"],
+    "evidence_format": "trust_center_quotes + links",
+    "keyword_matching_terms": ["risk management", "risk assessment", "enterprise risk", "threat model", "ISO 27001", "SOC 2 Type II"],
+    "llm_extraction_prompt": "Does this document mention conducting regular risk assessments, a risk management strategy, or an enterprise risk framework? Answer YES/NO + provide exact quote."
+  },
+  {
+    "control_id": "GV.SC-04",
+    "control_name": "Supply Chain Risk Management",
+    "function": "Govern",
+    "description": "Suppliers and third-party partners are evaluated and managed for cybersecurity risk.",
+    "observable_signals": [
+      "Vendor risk management policy published",
+      "Trust center mentions third-party risk assessments"
+    ],
+    "confidence_level": "HIGH",
+    "data_sources": ["website", "trust_center"],
+    "evidence_format": "trust_center_quotes + links",
+    "keyword_matching_terms": ["vendor risk management", "third-party risk", "supplier security", "subprocessors", "sub-processor"],
+    "llm_extraction_prompt": "Does this document mention assessing or managing the security of third-party vendors, suppliers, or subprocessors? Answer YES/NO + provide exact quote."
+  },
+  {
+    "control_id": "GV.OC-01",
+    "control_name": "Organizational Context",
+    "function": "Govern",
+    "description": "The organizational mission, objectives, stakeholders, and activities are understood and prioritized to inform cybersecurity roles.",
+    "observable_signals": [
+      "Clear statement of security commitment to customers",
+      "Security compliance certifications (SOC 2, ISO, PCI-DSS) that establish context"
+    ],
+    "confidence_level": "HIGH",
+    "data_sources": ["website", "trust_center"],
+    "evidence_format": "trust_center_quotes + structured_data",
+    "keyword_matching_terms": ["compliance program", "security commitment", "regulatory compliance", "PCI-DSS", "GDPR", "HIPAA", "FedRAMP"],
+    "llm_extraction_prompt": "Does this document mention a formal compliance program or adherence to specific regulatory standards (e.g., PCI-DSS, HIPAA, GDPR)? Answer YES/NO + provide exact quote."
+  },
+  {
+    "control_id": "PR.DS-01",
+    "control_name": "Data Encryption at Rest",
+    "function": "Protect",
+    "description": "Information and data at rest are protected.",
+    "observable_signals": [
+      "Trust Center states 'data encrypted at rest'",
+      "Public security documentation mentions AES-256 for storage"
+    ],
+    "confidence_level": "HIGH",
+    "data_sources": ["website", "trust_center"],
+    "evidence_format": "trust_center_quotes + links",
+    "keyword_matching_terms": ["AES", "encryption at rest", "encrypted at rest", "AES-256", "volume encryption", "database encryption"],
+    "llm_extraction_prompt": "Does this document mention encryption of data at rest (e.g., AES, DES, RSA)? Answer YES/NO + provide the exact quote."
+  },
+  {
+    "control_id": "PR.DS-02",
+    "control_name": "Data Encryption in Transit",
+    "function": "Protect",
+    "description": "Information and data in transit are protected.",
+    "observable_signals": [
+      "SSL/TLS certificate present and valid",
+      "Trust center mentions TLS 1.2 or TLS 1.3"
+    ],
+    "confidence_level": "HIGH",
+    "data_sources": ["website", "trust_center"],
+    "evidence_format": "certificate_details + trust_center_quotes",
+    "keyword_matching_terms": ["TLS", "SSL", "encryption in transit", "HTTPS", "encrypted in transit"],
+    "llm_extraction_prompt": "Does this document mention encryption of data in transit (e.g., TLS, SSL, HTTPS)? Answer YES/NO + provide exact quote."
+  },
+  {
+    "control_id": "PR.AC-01",
+    "control_name": "Identity and Access Management",
+    "function": "Protect",
+    "description": "Identities and credentials are managed for authorized devices, users, and processes.",
+    "observable_signals": [
+      "Mentions of SSO or SAML integration",
+      "Public documentation on role-based access control (RBAC)"
+    ],
+    "confidence_level": "HIGH",
+    "data_sources": ["website", "trust_center"],
+    "evidence_format": "trust_center_quotes + links",
+    "keyword_matching_terms": ["SSO", "SAML", "Single Sign-On", "RBAC", "role-based access control", "identity provider", "IdP"],
+    "llm_extraction_prompt": "Does this document mention access controls, identity management, or authentication mechanisms like SSO or RBAC? Answer YES/NO + provide exact quote."
+  },
+  {
+    "control_id": "PR.AC-03",
+    "control_name": "Authentication (MFA)",
+    "function": "Protect",
+    "description": "Authentication is implemented and managed.",
+    "observable_signals": [
+      "Mentions of Multi-Factor Authentication (MFA) or 2FA",
+      "Trust center mandates MFA for employee access"
+    ],
+    "confidence_level": "HIGH",
+    "data_sources": ["website", "trust_center"],
+    "evidence_format": "trust_center_quotes + links",
+    "keyword_matching_terms": ["MFA", "2FA", "Multi-Factor Authentication", "Two-Factor Authentication", "hardware key", "WebAuthn"],
+    "llm_extraction_prompt": "Does this document explicitly mention requiring Multi-Factor Authentication (MFA) or Two-Factor Authentication (2FA) for access? Answer YES/NO + provide exact quote."
+  },
+  {
+    "control_id": "PR.AT-01",
+    "control_name": "Security Awareness and Training",
+    "function": "Protect",
+    "description": "All users are informed and trained on their cybersecurity responsibilities.",
+    "observable_signals": [
+      "Trust center mentions annual security training",
+      "Mentions of phishing simulation programs"
+    ],
+    "confidence_level": "HIGH",
+    "data_sources": ["website", "trust_center"],
+    "evidence_format": "trust_center_quotes + links",
+    "keyword_matching_terms": ["security awareness training", "annual security training", "phishing simulation", "security training"],
+    "llm_extraction_prompt": "Does this document mention that employees undergo security awareness training or regular security training? Answer YES/NO + provide exact quote."
+  },
+  {
+    "control_id": "PR.DS-11",
+    "control_name": "Data Backups",
+    "function": "Protect",
+    "description": "Data are backed up and maintained.",
+    "observable_signals": [
+      "Trust center mentions regular backups",
+      "Disaster recovery documentation states backup frequency"
+    ],
+    "confidence_level": "HIGH",
+    "data_sources": ["website", "trust_center"],
+    "evidence_format": "trust_center_quotes + links",
+    "keyword_matching_terms": ["data backups", "backup schedule", "automated backups", "point-in-time recovery", "offsite backups"],
+    "llm_extraction_prompt": "Does this document mention taking regular data backups, automated backups, or offsite backups? Answer YES/NO + provide exact quote."
+  },
+  {
+    "control_id": "PR.IP-01",
+    "control_name": "Vulnerability Management",
+    "function": "Protect",
+    "description": "Vulnerability management plan is developed and implemented.",
+    "observable_signals": [
+      "Mentions of a bug bounty program",
+      "Trust center mentions regular penetration testing",
+      "Security.txt file points to a vulnerability disclosure policy"
+    ],
+    "confidence_level": "HIGH",
+    "data_sources": ["website", "trust_center"],
+    "evidence_format": "trust_center_quotes + links",
+    "keyword_matching_terms": ["bug bounty", "penetration testing", "vulnerability disclosure", "VDP", "vulnerability scanning", "HackerOne", "Bugcrowd"],
+    "llm_extraction_prompt": "Does this document mention regular penetration testing, vulnerability scanning, or a bug bounty/vulnerability disclosure program? Answer YES/NO + provide exact quote."
+  },
+  {
+    "control_id": "PR.IP-03",
+    "control_name": "Secure Software Development",
+    "function": "Protect",
+    "description": "System development life cycle processes are implemented and managed.",
+    "observable_signals": [
+      "Mentions of SSDLC, SAST, DAST, or code reviews",
+      "Trust center mentions secure coding practices"
+    ],
+    "confidence_level": "HIGH",
+    "data_sources": ["website", "trust_center"],
+    "evidence_format": "trust_center_quotes + links",
+    "keyword_matching_terms": ["SSDLC", "SAST", "DAST", "code review", "secure software development", "secure coding", "static analysis"],
+    "llm_extraction_prompt": "Does this document mention secure software development lifecycle (SSDLC), code reviews, or static/dynamic application security testing? Answer YES/NO + provide exact quote."
+  },
+  {
+    "control_id": "DE.CM-01",
+    "control_name": "Network Monitoring",
+    "function": "Detect",
+    "description": "The network and physical environment are monitored to detect potential cybersecurity events.",
+    "observable_signals": [
+      "Trust center mentions IDS/IPS, WAF, or 24/7 network monitoring"
+    ],
+    "confidence_level": "HIGH",
+    "data_sources": ["website", "trust_center"],
+    "evidence_format": "trust_center_quotes + links",
+    "keyword_matching_terms": ["IDS", "IPS", "WAF", "Web Application Firewall", "network monitoring", "intrusion detection", "DDoS protection"],
+    "llm_extraction_prompt": "Does this document mention network monitoring, intrusion detection systems (IDS/IPS), or a Web Application Firewall (WAF)? Answer YES/NO + provide exact quote."
+  },
+  {
+    "control_id": "DE.CM-03",
+    "control_name": "Personnel Activity Monitoring",
+    "function": "Detect",
+    "description": "Personnel activity is monitored to detect potential cybersecurity events.",
+    "observable_signals": [
+      "Trust center mentions endpoint detection (EDR/MDR) on employee devices"
+    ],
+    "confidence_level": "HIGH",
+    "data_sources": ["website", "trust_center"],
+    "evidence_format": "trust_center_quotes + links",
+    "keyword_matching_terms": ["EDR", "MDR", "endpoint detection", "endpoint protection", "MDM", "device management"],
+    "llm_extraction_prompt": "Does this document mention endpoint detection and response (EDR), mobile device management (MDM), or monitoring employee devices? Answer YES/NO + provide exact quote."
+  },
+  {
+    "control_id": "DE.AE-02",
+    "control_name": "Security Event Logging",
+    "function": "Detect",
+    "description": "Log records are generated, analyzed, and managed.",
+    "observable_signals": [
+      "Trust center mentions centralized logging or SIEM"
+    ],
+    "confidence_level": "HIGH",
+    "data_sources": ["website", "trust_center"],
+    "evidence_format": "trust_center_quotes + links",
+    "keyword_matching_terms": ["SIEM", "centralized logging", "audit logs", "event logging", "log retention"],
+    "llm_extraction_prompt": "Does this document mention centralized logging, audit logs, or a Security Information and Event Management (SIEM) system? Answer YES/NO + provide exact quote."
+  },
+  {
+    "control_id": "DE.DP-02",
+    "control_name": "Continuous Security Monitoring",
+    "function": "Detect",
+    "description": "Detection activities comply with all applicable requirements and can identify events in a timely manner.",
+    "observable_signals": [
+      "Mentions of a Security Operations Center (SOC) or 24/7 monitoring team"
+    ],
+    "confidence_level": "HIGH",
+    "data_sources": ["website", "trust_center"],
+    "evidence_format": "trust_center_quotes + links",
+    "keyword_matching_terms": ["Security Operations Center", "SOC team", "24/7 monitoring", "continuous monitoring"],
+    "llm_extraction_prompt": "Does this document mention a Security Operations Center (SOC) or 24/7 continuous security monitoring? Answer YES/NO + provide exact quote."
+  },
+  {
+    "control_id": "RS.CO-01",
+    "control_name": "Coordination and Communication",
+    "function": "Respond",
+    "description": "Personnel know their roles and order of operations when a response is needed.",
+    "observable_signals": [
+      "Mentions of an incident communication plan or status page"
+    ],
+    "confidence_level": "HIGH",
+    "data_sources": ["website", "trust_center"],
+    "evidence_format": "trust_center_quotes + links",
+    "keyword_matching_terms": ["incident communication", "breach notification", "status page", "incident notification"],
+    "llm_extraction_prompt": "Does this document describe incident response procedures, communication plans, or breach notification processes? Answer YES/NO + provide exact quote."
+  },
+  {
+    "control_id": "RS.RP-01",
+    "control_name": "Response Plan Execution",
+    "function": "Respond",
+    "description": "Response plan is executed during or after an incident.",
+    "observable_signals": [
+      "Trust center mentions a formalized Incident Response Plan (IRP)",
+      "Mentions of regular incident tabletop exercises"
+    ],
+    "confidence_level": "HIGH",
+    "data_sources": ["website", "trust_center"],
+    "evidence_format": "trust_center_quotes + links",
+    "keyword_matching_terms": ["Incident Response Plan", "IRP", "tabletop exercise", "incident handling"],
+    "llm_extraction_prompt": "Does this document mention having a formal Incident Response Plan (IRP) or conducting tabletop exercises? Answer YES/NO + provide exact quote."
+  },
+  {
+    "control_id": "RC.RP-01",
+    "control_name": "Recovery Plan Execution",
+    "function": "Recover",
+    "description": "Recovery plan is executed during or after a cybersecurity incident.",
+    "observable_signals": [
+      "Trust center mentions a Disaster Recovery Plan (DRP) or Business Continuity Plan (BCP)",
+      "Mentions of RTO/RPO targets"
+    ],
+    "confidence_level": "HIGH",
+    "data_sources": ["website", "trust_center"],
+    "evidence_format": "trust_center_quotes + links",
+    "keyword_matching_terms": ["Disaster Recovery Plan", "Business Continuity Plan", "DRP", "BCP", "RTO", "RPO", "Recovery Time Objective"],
+    "llm_extraction_prompt": "Does this document mention a Disaster Recovery Plan (DRP), Business Continuity Plan (BCP), or recovery time objectives (RTO/RPO)? Answer YES/NO + provide exact quote."
+  }
+]

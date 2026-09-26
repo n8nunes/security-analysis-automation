@@ -1,0 +1,7 @@
+{
+  "ollama_host": "http://localhost:11434",
+  "ollama_model": "llama3.1",
+  "ollama_timeout": 30,
+  "keyword_match_threshold": 0.6,
+  "enable_llm": true
+}

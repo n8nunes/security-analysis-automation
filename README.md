@@ -1,125 +1,44 @@
-# Security Analysis Automation
-
-An automated Governance, Risk, and Compliance (GRC) assessment agent that performs passive reconnaissance and maps findings to security frameworks. This tool automatically aggregates intelligence from public data sources to generate client-ready, professional security assessment reports.
-
-A hiring manager or a security team looking at this project will see a practical demonstration of software engineering fundamentals, structured risk thinking, and real-world framework mapping.
-
----
-
-## Technical Architecture
-
-The tool uses a multi-layered automation pipeline to move from a simple company name to a comprehensive compliance deliverable:
-
-1. **User Input:** Accepts a company name, domain, and optional ticker or internal documentation.
-
-
-2. **Orchestration Layer:** Powered by local LLMs via Ollama to perform token-efficient reasoning.
-
-
-3. **Intelligence Tool Belt:** Parallelized workers gathering live passive telemetry and public records.
-
-
-4. **Two Pass Analysis:** Pass 1 extracts technical findings while Pass 2 handles deterministic framework alignment and risk scoring.
-
-
-5. **Structured Report Generation:** Outputs high-fidelity terminal views, portable JSON data, or stylized HTML reports designed to easily print to PDF.
-
-
-
----
-
-## Project Roadmap and Development Phases
-
-This project was built iteratively across five distinct development phases:
-
-### Phase 1: Proof of Concept
-
-* Focused on establishing the core orchestration loop.
-
-
-* Built a foundational Python script capable of accepting user targets.
-
-
-* Directed the LLM engine to analyze raw text inputs and generate structured textual risk analysis.
-
-
-
-### Phase 2: Passive Data Source Integration
-
-* Expanded the intelligence tool belt by implementing parallel API connections and scrapers.
-
-
-* Integrated the Qualys SSL Labs API to assess transport layer security configurations.
-
-
-* Embedded automated checks for HTTP security headers.
-
-
-* Added news intelligence aggregation and OSINT querying via Tavily to flag historical security incidents.
-
-
-* Connected corporate public disclosures by checking ASX company announcements and OAIC data breach records.
-
-
-
-### Phase 3: Framework Mapping and Risk Register
-
-* Implemented a formal risk register utilizing a standard likelihood and impact matrix.
-
-
-* Developed deterministic prompt guardrails to map technical observations straight to major compliance baselines: the Australian Cyber Security Centre (ACSC) Essential Eight, ISO 27001, NIST CSF 2.0, and the Australian Privacy Principles (APPs).
-
-
-* Designed specific guardrails preventing AI hallucination, ensuring any control unobservable by passive scanning defaults strictly to a clean, non-assumed status unless supported by concrete documentary evidence.
-
-
-
-### Phase 4: Professional Report Generation
-
-* Transformed raw terminal outputs into enterprise-grade consulting deliverables.
-
-
-* Configured a custom HTML layout engine featuring clean typography, clear visual risk hierarchies, corporate branding, and strict page-break control.
-
-
-* Embedded clear, necessary disclaimers defining the boundaries of the tool: clarifying that it handles passive reconnaissance only, generates indicative findings, requires professional human oversight, and is never a substitute for authorized penetration testing.
-
-
-* Implemented a fallback document generation pipeline ensuring look-and-feel consistency across different execution platforms.
-
-
-
-### Phase 5: Web Frontend and Deployment
-
-* Developed an intuitive user interface to wrap the underlying CLI tool.
-* Created a single-input interface where a user can enter a company domain, view progress indicators, and directly fetch their compliance files.
-* Structured the web application layout for seamless hosting on lightweight deployment platforms like Vercel or Railway.
-
-
-
----
-
-## Setup and Dependencies
-
-The backend engine depends heavily on Python along with a small, specialized selection of packages for scraping, parsing, and rendering:
-
-* `requests` for robust endpoint interaction.
-
-
-* `beautifulsoup4` and `lxml` for structured web scraping.
-
-
-* `rich` for formatting complex data layouts inside the command line interface.
-
-
-* `python-dotenv` for local environment configuration and key safety.
-
-
-
----
-
-## Critical Operating Methodology
-
-This tool operates under strict professional boundaries. Because it relies exclusively on public information, evaluating internal technical controls directly is not possible without context.
-
-To bridge the gap between passive telemetry and internal posture, users should supply internal documentation (such as a public privacy statement, an annual report, or an information security policy) utilizing the script's document flag. When provided, the engine extracts documented operational claims and parses them directly against the framework models, turning unverified items into evidence-backed compliance analysis.
+# NIST CSF Security Posture Analysis Tool - Backend & Core Engine
+
+This project provides the core backend and analysis engine for an automated OSINT-based security posture assessment tool. It parses public information (website, trust center) to evaluate a company's adherence to the NIST Cybersecurity Framework.
+
+## Features
+- Scans websites and Trust Centers for security artifacts
+- Validates 20 high-confidence NIST CSF controls across 5 functions (Govern, Protect, Detect, Respond, Recover)
+- **Keyword-First Strategy**: Prioritizes fast, precise keyword matching and certificate validation.
+- **LLM Fallback**: Uses a local Ollama model (Llama 3.1) for semantic extraction when keywords fail.
+- **Graceful Degradation**: Seamlessly falls back to keyword-only mode if the LLM is unavailable.
+- Provides actionable gap narratives generated by LLM.
+
+## Setup Instructions
+1. Install dependencies:
+   ```bash
+   python -m venv venv
+   source venv/bin/activate
+   pip install -r requirements.txt
+   ```
+2. Configure environment:
+   ```bash
+   cp .env.example .env
+   ```
+3. Set up Ollama:
+   - Install Ollama (https://ollama.ai)
+   - Pull the model: `ollama pull llama3.1`
+   - Start the server: `ollama serve` (Runs on localhost:11434 by default)
+
+4. Run the API:
+   ```bash
+   uvicorn src.api.main:app --reload
+   ```
+
+## API Documentation
+- `POST /api/scan`: Start a scan.
+  Body: `{"domain": "stripe.com", "trust_center_url": "https://stripe.com/trust"}`
+- `GET /api/health`: Health check.
+- `GET /api/config`: Current configuration.
+
+## Adding New Control Mappings
+To add new controls, update `src/mappings/nist_controls.json`. Ensure the control has all required fields, including `keyword_matching_terms` and an `llm_extraction_prompt`.
+
+## Disclaimer
+This analysis is based on publicly available OSINT data and LLM-assisted semantic analysis. It is for educational purposes only and is not a compliance audit, certification, or professional opinion. All LLM-extracted claims are marked and should be independently verified. This tool should not be used for certification or regulatory claims.
