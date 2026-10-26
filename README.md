@@ -1,4 +1,3 @@
-<<<<<<< HEAD
 # NIST CSF Security Posture Analysis Tool - Backend & Core Engine
 
 This project provides the core backend and analysis engine for an automated OSINT-based security posture assessment tool. It parses public information (website, trust center) to evaluate a company's adherence to the NIST Cybersecurity Framework.
@@ -167,4 +166,4 @@ The backend engine depends heavily on Python along with a small, specialized sel
 This tool operates under strict professional boundaries. Because it relies exclusively on public information, evaluating internal technical controls directly is not possible without context.
 
 To bridge the gap between passive telemetry and internal posture, users should supply internal documentation (such as a public privacy statement, an annual report, or an information security policy) utilizing the script's document flag. When provided, the engine extracts documented operational claims and parses them directly against the framework models, turning unverified items into evidence-backed compliance analysis.
->>>>>>> a8906252cc9b233df771dae394883d0770b0806b
+
